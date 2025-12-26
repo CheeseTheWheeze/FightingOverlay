@@ -1,0 +1,46 @@
+name: Build Windows Artifacts
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Build bootstrapper
+        run: pyinstaller bootstrap/bootstrapper.py --onefile --name GrapplingOverlayBootstrap
+      - name: Build Control Center
+        run: pyinstaller apps/control_center/main.py --onedir --name ControlCenter
+      - name: Package full app zip
+        run: |
+          powershell -Command "Compress-Archive -Path dist/ControlCenter/* -DestinationPath GrapplingOverlay-Full-Windows.zip -Force"
+      - name: Run bootstrapper self-test
+        run: dist/GrapplingOverlayBootstrap.exe --self-test
+      - name: Run Control Center test mode
+        run: dist/ControlCenter/ControlCenter.exe --test-mode
+      - name: Upload bootstrapper artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GrapplingOverlayBootstrap
+          path: dist/GrapplingOverlayBootstrap.exe
+      - name: Upload full app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GrapplingOverlay-Full-Windows
+          path: GrapplingOverlay-Full-Windows.zip
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/GrapplingOverlayBootstrap.exe
+            GrapplingOverlay-Full-Windows.zip
