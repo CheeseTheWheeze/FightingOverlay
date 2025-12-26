@@ -1,0 +1,1 @@
+"""Future FastAPI entrypoint stub."""
