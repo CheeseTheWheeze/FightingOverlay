@@ -3,6 +3,8 @@ name: CI
 on:
   push:
     branches: ["**"]
+    tags:
+      - "v*"
 
 jobs:
   build-windows:
@@ -24,7 +26,12 @@ jobs:
           pyinstaller --onedir --name ControlCenter apps/control_center/main.py
       - name: Package Full Zip
         run: |
-          powershell -Command "Compress-Archive -Path dist/ControlCenter/* -DestinationPath FightingOverlay-Full-Windows.zip"
+          powershell -Command "Compress-Archive -Path dist/ControlCenter/* -DestinationPath dist/ControlCenter.zip"
+      - name: Prepare release assets
+        run: |
+          powershell -Command "New-Item -ItemType Directory -Force dist | Out-Null"
+          powershell -Command "Copy-Item dist/FightingOverlayBootstrap.exe dist/FightingOverlayBootstrap.exe -Force"
+          powershell -Command "Move-Item dist/ControlCenter.zip dist/FightingOverlay-Full-Windows.zip -Force"
       - name: Run Control Center test mode
         run: |
           dist/ControlCenter/ControlCenter.exe --test-mode
@@ -38,7 +45,7 @@ jobs:
           name: fightingoverlay-builds
           path: |
             dist/FightingOverlayBootstrap.exe
-            FightingOverlay-Full-Windows.zip
+            dist/FightingOverlay-Full-Windows.zip
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -55,5 +62,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release_assets/FightingOverlayBootstrap.exe
-            release_assets/FightingOverlay-Full-Windows.zip
+            release_assets/dist/FightingOverlayBootstrap.exe
+            release_assets/dist/FightingOverlay-Full-Windows.zip
