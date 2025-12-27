@@ -16,6 +16,8 @@ from subprocess import run, Popen
 
 from core.paths import (
     get_app_root,
+    get_bootstrap_root,
+    get_bootstrapper_path,
     get_current_pointer,
     get_data_root,
     get_last_update_path,
@@ -27,7 +29,6 @@ from core.paths import (
 
 RELEASES_URL = "https://api.github.com/repos/CheeseTheWheeze/FightingOverlay/releases/latest"
 ASSET_NAME = "FightingOverlay-Full-Windows.zip"
-BOOTSTRAP_COPY_NAME = "FightingOverlayBootstrap.exe"
 
 
 def setup_logging() -> Path:
@@ -49,6 +50,7 @@ def ensure_directories() -> None:
     get_outputs_root().mkdir(parents=True, exist_ok=True)
     get_models_root().mkdir(parents=True, exist_ok=True)
     get_versions_root().mkdir(parents=True, exist_ok=True)
+    get_bootstrap_root().mkdir(parents=True, exist_ok=True)
 
 
 def show_message(title: str, message: str) -> None:
@@ -121,13 +123,49 @@ def update_shortcut(target: Path) -> None:
     run(["powershell", "-NoProfile", "-Command", script], check=False)
 
 
-def copy_bootstrapper() -> Path:
-    app_root = get_app_root()
-    app_root.mkdir(parents=True, exist_ok=True)
-    destination = app_root / BOOTSTRAP_COPY_NAME
+def _files_match(source: Path, destination: Path) -> bool:
+    try:
+        source_stat = source.stat()
+        destination_stat = destination.stat()
+    except FileNotFoundError:
+        return False
+    return (
+        source_stat.st_size == destination_stat.st_size
+        and source_stat.st_mtime_ns == destination_stat.st_mtime_ns
+    )
+
+
+def _safe_version_label(version: str) -> str:
+    cleaned = "".join(char for char in version if char.isalnum() or char in ("-", "_", "."))
+    return cleaned or "unknown"
+
+
+def copy_bootstrapper(version: str) -> Path:
+    bootstrap_root = get_bootstrap_root()
+    bootstrap_root.mkdir(parents=True, exist_ok=True)
+    destination = get_bootstrapper_path()
     source = Path(sys.executable)
-    if getattr(sys, "frozen", False) and source.exists() and source.resolve() != destination.resolve():
-        shutil.copy2(source, destination)
+    if not getattr(sys, "frozen", False) or not source.exists():
+        return destination
+    if source.resolve() == destination.resolve():
+        return destination
+    if destination.exists() and _files_match(source, destination):
+        logging.info("Bootstrapper already up to date at %s", destination)
+        return destination
+
+    version_label = _safe_version_label(version)
+    versioned_destination = bootstrap_root / f"FightingOverlayBootstrap_{version_label}.exe"
+    if not (versioned_destination.exists() and _files_match(source, versioned_destination)):
+        try:
+            shutil.copy2(source, versioned_destination)
+        except PermissionError as exc:
+            logging.warning("Bootstrapper copy failed: %s", exc)
+            return destination
+
+    try:
+        os.replace(versioned_destination, destination)
+    except PermissionError as exc:
+        logging.warning("Bootstrapper replace failed: %s", exc)
     return destination
 
 
@@ -203,7 +241,10 @@ def main() -> int:
         target_dir = install_release(release)
         atomic_write(get_current_pointer(), str(target_dir.resolve()))
         update_shortcut(target_dir / "ControlCenter.exe")
-        copy_bootstrapper()
+        try:
+            copy_bootstrapper(version)
+        except PermissionError as exc:
+            logging.warning("Bootstrapper update skipped due to permission error: %s", exc)
         record_last_update("success", version, "Installed successfully")
         clean_old_versions(version, previous_version)
         launch_control_center(target_dir)

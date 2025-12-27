@@ -12,6 +12,7 @@ from tkinter import Tk, messagebox, ttk
 
 from core.paths import (
     get_app_root,
+    get_bootstrapper_path,
     get_current_pointer,
     get_data_root,
     get_last_update_path,
@@ -73,10 +74,10 @@ def check_updates() -> tuple[bool, str]:
 
 
 def run_bootstrap_update() -> tuple[bool, str]:
-    bootstrap_path = get_app_root() / "FightingOverlayBootstrap.exe"
+    bootstrap_path = get_bootstrapper_path()
     if not bootstrap_path.exists():
         return False, "Bootstrapper not found. Please download FightingOverlayBootstrap.exe from Releases."
-    subprocess.Popen([str(bootstrap_path), "--update"], cwd=str(get_app_root()))
+    subprocess.Popen([str(bootstrap_path), "--update"], cwd=str(bootstrap_path.parent))
     return True, "Update started"
 
 
