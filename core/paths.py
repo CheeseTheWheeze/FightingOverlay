@@ -43,3 +43,11 @@ def get_current_pointer() -> Path:
 
 def get_last_update_path() -> Path:
     return get_app_root() / "last_update.json"
+
+
+def get_bootstrap_root() -> Path:
+    return _require_local_appdata() / APP_NAME / "bootstrap"
+
+
+def get_bootstrapper_path() -> Path:
+    return get_bootstrap_root() / "FightingOverlayBootstrap.exe"
