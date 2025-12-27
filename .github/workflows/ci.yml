@@ -88,7 +88,42 @@ jobs:
           powershell -Command "Get-ChildItem -Path release_upload | Format-List -Property FullName,Length"
           powershell -Command "if (-not (Test-Path -Path release_upload/FightingOverlayBootstrap.exe)) { throw 'Missing FightingOverlayBootstrap.exe in release_upload' }"
           powershell -Command "if (-not (Test-Path -Path release_upload/FightingOverlay-Full-Windows.zip)) { throw 'Missing FightingOverlay-Full-Windows.zip in release_upload' }"
-      - name: Create Release
+      - name: Create archive tag
+        shell: pwsh
+        run: |
+          $ts = Get-Date -Format "yyyyMMdd-HHmm"
+          $sha = "${{ github.sha }}".Substring(0,7)
+          $tag = "build-$ts-$sha"
+          "ARCHIVE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          $payload = @{
+            ref = "refs/tags/$tag"
+            sha = "${{ github.sha }}"
+          } | ConvertTo-Json
+
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          $uri = "https://api.github.com/repos/${{ github.repository }}/git/refs"
+          Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $payload | Out-Null
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create archive release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.ARCHIVE_TAG }}
+          name: Archived build ${{ env.ARCHIVE_TAG }}
+          prerelease: false
+          draft: false
+          files: |
+            release_upload/FightingOverlayBootstrap.exe
+            release_upload/FightingOverlay-Full-Windows.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create latest release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
