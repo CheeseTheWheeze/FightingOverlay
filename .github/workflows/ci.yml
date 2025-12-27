@@ -25,9 +25,6 @@ jobs:
       - name: Build Control Center
         run: |
           pyinstaller --onedir --name ControlCenter apps/control_center/main.py
-      - name: Package Full Zip
-        run: |
-          powershell -Command "Compress-Archive -Path dist/ControlCenter/* -DestinationPath dist/ControlCenter.zip"
       - name: Diagnose build outputs
         run: |
           pwsh -Command "Get-ChildItem -Recurse -Force dist, release_assets, package_root, apps, . | Select-Object FullName, Length"
@@ -51,12 +48,34 @@ jobs:
 
           New-Item -ItemType Directory -Force release_upload | Out-Null
           Copy-Item $bootstrapExe release_upload/FightingOverlayBootstrap.exe -Force
-          Compress-Archive -Path (Join-Path $fullAppDir '*') -DestinationPath release_upload/FightingOverlay-Full-Windows.zip -Force
+
+          $stageDir = Join-Path $PWD 'release_stage'
+          if (Test-Path $stageDir) { Remove-Item -Recurse -Force $stageDir }
+          New-Item -ItemType Directory -Force $stageDir | Out-Null
+          Copy-Item -Path (Join-Path $fullAppDir '*') -Destination $stageDir -Recurse -Force
+          Get-ChildItem -Path $stageDir -Recurse -Filter '*.zip' | Remove-Item -Force
+
+          Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath release_upload/FightingOverlay-Full-Windows.zip -Force
+          '@
+      - name: Guardrail: ensure no nested zip in Full-Windows.zip
+        run: |
+          pwsh -Command @'
+          $zipPath = "release_upload/FightingOverlay-Full-Windows.zip"
+          $zipEntries = @(tar -tf $zipPath | findstr /i ".zip" 2>$null)
+          if ($zipEntries.Count -gt 0) {
+            $unexpected = $zipEntries | Where-Object { $_ -notmatch "base_library\\.zip$" }
+            if ($unexpected.Count -gt 0) {
+              throw "Unexpected nested zip entries: $($unexpected -join ', ')"
+            }
+          }
           '@
       - name: Run Control Center test mode
         run: |
           dist/ControlCenter/ControlCenter.exe --test-mode
         continue-on-error: true
+      - name: Run schema validation tests
+        run: |
+          python -m unittest discover -s tests
       - name: Run Bootstrap self-test
         run: |
           dist/FightingOverlayBootstrap.exe --self-test
