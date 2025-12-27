@@ -58,17 +58,15 @@ jobs:
           Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath release_upload/FightingOverlay-Full-Windows.zip -Force
           '@
       - name: Guardrail: ensure no nested zip in Full-Windows.zip
+        shell: pwsh
         run: |
-          pwsh -Command @'
           $zipPath = "release_upload/FightingOverlay-Full-Windows.zip"
-          $zipEntries = @(tar -tf $zipPath | findstr /i ".zip" 2>$null)
-          if ($zipEntries.Count -gt 0) {
-            $unexpected = $zipEntries | Where-Object { $_ -notmatch "base_library\\.zip$" }
-            if ($unexpected.Count -gt 0) {
-              throw "Unexpected nested zip entries: $($unexpected -join ', ')"
-            }
-          }
-          '@
+          if (-not (Test-Path $zipPath)) { throw "Missing zip: $zipPath" }
+          $entries = tar -tf $zipPath 2>$null
+          if (-not $entries) { throw "tar failed reading $zipPath" }
+          $zipEntries = $entries | Where-Object { $_ -match '\.zip$' }
+          $unexpected = $zipEntries | Where-Object { $_ -notmatch 'base_library\.zip$' }
+          if ($unexpected) { throw ("Unexpected nested zip entries: " + ($unexpected -join ", ")) }
       - name: Run Control Center test mode
         run: |
           dist/ControlCenter/ControlCenter.exe --test-mode
