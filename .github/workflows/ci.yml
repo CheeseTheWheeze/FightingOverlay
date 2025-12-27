@@ -28,11 +28,31 @@ jobs:
       - name: Package Full Zip
         run: |
           powershell -Command "Compress-Archive -Path dist/ControlCenter/* -DestinationPath dist/ControlCenter.zip"
+      - name: Diagnose build outputs
+        run: |
+          pwsh -Command "Get-ChildItem -Recurse -Force dist, release_assets, package_root, apps, . | Select-Object FullName, Length"
       - name: Prepare release assets
         run: |
-          powershell -Command "New-Item -ItemType Directory -Force dist | Out-Null"
-          powershell -Command "Copy-Item dist/FightingOverlayBootstrap.exe dist/FightingOverlayBootstrap.exe -Force"
-          powershell -Command "Move-Item dist/ControlCenter.zip dist/FightingOverlay-Full-Windows.zip -Force"
+          pwsh -Command @'
+          $bootstrapExe = @(
+            'dist/FightingOverlayBootstrap.exe',
+            'dist/FightingOverlayBootstrap/FightingOverlayBootstrap.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $bootstrapExe) { throw 'Unable to locate FightingOverlayBootstrap.exe in dist output' }
+
+          $fullAppDir = @(
+            'dist/FightingOverlay',
+            'dist/ControlCenter'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $fullAppDir) { throw 'Unable to locate full app output folder in dist' }
+
+          "BOOTSTRAP_EXE=$bootstrapExe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "FULL_APP_DIR=$fullAppDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          New-Item -ItemType Directory -Force release_upload | Out-Null
+          Copy-Item $bootstrapExe release_upload/FightingOverlayBootstrap.exe -Force
+          Compress-Archive -Path (Join-Path $fullAppDir '*') -DestinationPath release_upload/FightingOverlay-Full-Windows.zip -Force
+          '@
       - name: Run Control Center test mode
         run: |
           dist/ControlCenter/ControlCenter.exe --test-mode
@@ -45,8 +65,8 @@ jobs:
         with:
           name: fightingoverlay-builds
           path: |
-            dist/FightingOverlayBootstrap.exe
-            dist/FightingOverlay-Full-Windows.zip
+            release_upload/FightingOverlayBootstrap.exe
+            release_upload/FightingOverlay-Full-Windows.zip
 
   release:
     needs: build-windows
@@ -61,8 +81,8 @@ jobs:
       - name: Prepare release upload folder
         run: |
           powershell -Command "New-Item -ItemType Directory -Force release_upload | Out-Null"
-          powershell -Command "Copy-Item release_assets/dist/FightingOverlayBootstrap.exe release_upload/FightingOverlayBootstrap.exe -Force"
-          powershell -Command "Copy-Item release_assets/dist/FightingOverlay-Full-Windows.zip release_upload/FightingOverlay-Full-Windows.zip -Force"
+          powershell -Command "Copy-Item release_assets/FightingOverlayBootstrap.exe release_upload/FightingOverlayBootstrap.exe -Force"
+          powershell -Command "Copy-Item release_assets/FightingOverlay-Full-Windows.zip release_upload/FightingOverlay-Full-Windows.zip -Force"
       - name: Verify release upload assets
         run: |
           powershell -Command "Get-ChildItem -Path release_upload | Format-List -Property FullName,Length"
