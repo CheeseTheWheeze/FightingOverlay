@@ -6,6 +6,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -58,9 +61,18 @@ jobs:
         with:
           name: fightingoverlay-builds
           path: release_assets
+      - name: Prepare release upload folder
+        run: |
+          powershell -Command "New-Item -ItemType Directory -Force release_upload | Out-Null"
+          powershell -Command "Copy-Item release_assets/FightingOverlayBootstrap.exe release_upload/FightingOverlayBootstrap.exe -Force"
+          powershell -Command "Copy-Item release_assets/FightingOverlay-Full-Windows.zip release_upload/FightingOverlay-Full-Windows.zip -Force"
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
           files: |
-            release_assets/dist/FightingOverlayBootstrap.exe
-            release_assets/dist/FightingOverlay-Full-Windows.zip
+            release_upload/FightingOverlayBootstrap.exe
+            release_upload/FightingOverlay-Full-Windows.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
