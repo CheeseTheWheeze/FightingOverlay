@@ -64,8 +64,13 @@ jobs:
       - name: Prepare release upload folder
         run: |
           powershell -Command "New-Item -ItemType Directory -Force release_upload | Out-Null"
-          powershell -Command "Copy-Item release_assets/FightingOverlayBootstrap.exe release_upload/FightingOverlayBootstrap.exe -Force"
-          powershell -Command "Copy-Item release_assets/FightingOverlay-Full-Windows.zip release_upload/FightingOverlay-Full-Windows.zip -Force"
+          powershell -Command "Copy-Item release_assets/dist/FightingOverlayBootstrap.exe release_upload/FightingOverlayBootstrap.exe -Force"
+          powershell -Command "Copy-Item release_assets/dist/FightingOverlay-Full-Windows.zip release_upload/FightingOverlay-Full-Windows.zip -Force"
+      - name: Verify release upload assets
+        run: |
+          powershell -Command "Get-ChildItem -Path release_upload | Format-List -Property FullName,Length"
+          powershell -Command "if (-not (Test-Path -Path release_upload/FightingOverlayBootstrap.exe)) { throw 'Missing FightingOverlayBootstrap.exe in release_upload' }"
+          powershell -Command "if (-not (Test-Path -Path release_upload/FightingOverlay-Full-Windows.zip)) { throw 'Missing FightingOverlay-Full-Windows.zip in release_upload' }"
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
