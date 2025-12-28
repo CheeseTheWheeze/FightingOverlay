@@ -59,7 +59,7 @@ jobs:
 
           Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath release_upload/FightingOverlay-Full-Windows.zip -Force
           '@
-      - name: Guardrail: ensure no nested zip in Full-Windows.zip
+      - name: "Guardrail: ensure no nested zip in Full-Windows.zip"
         shell: pwsh
         run: |
           $zipPath = "release_upload/FightingOverlay-Full-Windows.zip"
