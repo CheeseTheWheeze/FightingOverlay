@@ -189,6 +189,7 @@ def main() -> None:
     save_pose_var = BooleanVar(value=True)
     save_thumbnails_var = BooleanVar(value=False)
     save_background_var = BooleanVar(value=True)
+    draw_all_tracks_var = BooleanVar(value=False)
     foreground_mode_var = StringVar(value="Auto (closest/most active)")
 
     cancel_event = threading.Event()
@@ -354,8 +355,14 @@ def main() -> None:
 
     export_overlay_check = ttk.Checkbutton(settings_group, text="Export overlay video (MP4)", variable=export_overlay_var)
     export_overlay_check.grid(row=0, column=0, sticky="w")
+    draw_all_tracks_check = ttk.Checkbutton(
+        settings_group,
+        text="Draw all tracks (debug)",
+        variable=draw_all_tracks_var,
+    )
+    draw_all_tracks_check.grid(row=1, column=0, sticky="w")
 
-    ttk.Label(settings_group, text="Foreground selection mode").grid(row=1, column=0, sticky="w", pady=(8, 2))
+    ttk.Label(settings_group, text="Foreground selection mode").grid(row=2, column=0, sticky="w", pady=(8, 2))
     mode_combo = ttk.Combobox(
         settings_group,
         textvariable=foreground_mode_var,
@@ -366,7 +373,7 @@ def main() -> None:
         ],
         state="readonly",
     )
-    mode_combo.grid(row=2, column=0, sticky="ew")
+    mode_combo.grid(row=3, column=0, sticky="ew")
 
     update_group = ttk.LabelFrame(settings_tab, text="Updates", padding=12)
     update_group.grid(row=1, column=0, sticky="ew", pady=(12, 0))
@@ -403,6 +410,7 @@ def main() -> None:
             save_thumbnails_check,
             save_background_check,
             export_overlay_check,
+            draw_all_tracks_check,
             mode_combo,
         ]
     )
@@ -476,6 +484,7 @@ def main() -> None:
                     save_thumbnails=save_thumbnails_var.get(),
                     save_background_tracks=save_background_var.get(),
                     foreground_mode="Auto (closest/most active)",
+                    draw_all_tracks=draw_all_tracks_var.get(),
                 )
                 pose_path = run_pipeline(
                     Path(selected_video.get()),
