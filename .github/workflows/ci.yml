@@ -53,21 +53,22 @@ jobs:
           if (Test-Path $stageDir) { Remove-Item -Recurse -Force $stageDir }
           New-Item -ItemType Directory -Force $stageDir | Out-Null
           Copy-Item -Path (Join-Path $fullAppDir '*') -Destination $stageDir -Recurse -Force
-          Get-ChildItem -Path $stageDir -Recurse -Filter '*.zip' | Remove-Item -Force
+          Get-ChildItem -Path $stageDir -Recurse -Filter '*.zip' |
+            Where-Object { $_.Name -ne 'base_library.zip' } |
+            Remove-Item -Force
 
           Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath release_upload/FightingOverlay-Full-Windows.zip -Force
           '@
-      # TODO: Re-enable guardrail check for nested zips once CI instability is resolved.
-      # - name: Guardrail: ensure no nested zip in Full-Windows.zip
-      #   shell: pwsh
-      #   run: |
-      #     $zipPath = "release_upload/FightingOverlay-Full-Windows.zip"
-      #     if (-not (Test-Path $zipPath)) { throw "Missing zip: $zipPath" }
-      #     $entries = tar -tf $zipPath 2>$null
-      #     if (-not $entries) { throw "tar failed reading $zipPath" }
-      #     $zipEntries = $entries | Where-Object { $_ -match '\.zip$' }
-      #     $unexpected = $zipEntries | Where-Object { $_ -notmatch 'base_library\.zip$' }
-      #     if ($unexpected) { throw ("Unexpected nested zip entries: " + ($unexpected -join ", ")) }
+      - name: Guardrail: ensure no nested zip in Full-Windows.zip
+        shell: pwsh
+        run: |
+          $zipPath = "release_upload/FightingOverlay-Full-Windows.zip"
+          if (-not (Test-Path $zipPath)) { throw "Missing zip: $zipPath" }
+          $entries = tar -tf $zipPath 2>$null
+          if (-not $entries) { throw "tar failed reading $zipPath" }
+          $zipEntries = $entries | Where-Object { $_ -match '\.zip$' }
+          $unexpected = $zipEntries | Where-Object { $_ -notmatch 'base_library\.zip$' }
+          if ($unexpected) { throw ("Unexpected nested zip entries: " + ($unexpected -join ", ")) }
       - name: Run Control Center test mode
         run: |
           dist/ControlCenter/ControlCenter.exe --test-mode
