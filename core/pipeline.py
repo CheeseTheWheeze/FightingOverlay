@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import logging
 import math
-import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - optional dependency
     cv2 = None
 
 StatusCallback = Callable[[str, float | None], None]
+InfoCallback = Callable[[dict[str, object]], None]
 
 
 @dataclass
@@ -38,6 +39,11 @@ def _now_ms() -> int:
 def _update_status(callback: StatusCallback | None, message: str, progress: float | None = None) -> None:
     if callback:
         callback(message, progress)
+
+
+def _update_info(callback: InfoCallback | None, info: dict[str, object]) -> None:
+    if callback:
+        callback(info)
 
 
 def load_video_metadata(video_path: Path | None) -> dict[str, float | int | str]:
@@ -100,6 +106,7 @@ def generate_synthetic_tracks(
     width: int,
     height: int,
     cancel_event: object | None = None,
+    info_callback: InfoCallback | None = None,
 ) -> list[dict[str, object]]:
     tracks: list[dict[str, object]] = []
     for track_index in range(3):
@@ -107,6 +114,17 @@ def generate_synthetic_tracks(
         for frame_index in range(frame_count):
             if cancel_event is not None and getattr(cancel_event, "is_set")():
                 raise ProcessingCancelled("Processing cancelled")
+            if frame_index % 5 == 0 or frame_index == frame_count - 1:
+                _update_info(
+                    info_callback,
+                    {
+                        "stage": "Running inference",
+                        "frame_index": frame_index + 1,
+                        "total_frames": frame_count,
+                        "people": 3,
+                        "effective_fps": fps,
+                    },
+                )
             bbox = _synthetic_bbox(frame_index, track_index, width, height)
             frames.append(
                 {
@@ -182,16 +200,19 @@ def run_inference(
     options: ProcessingOptions,
     cancel_event: object | None = None,
     status_callback: StatusCallback | None = None,
+    info_callback: InfoCallback | None = None,
 ) -> dict[str, object]:
-    _update_status(status_callback, "Loading video metadata...", 5)
+    _update_status(status_callback, "Loading video...", 5)
+    _update_info(info_callback, {"stage": "Loading video"})
     video_meta = load_video_metadata(video_path)
     frame_count = int(video_meta["frame_count"])
     fps = float(video_meta["fps"])
     width = int(video_meta["width"])
     height = int(video_meta["height"])
 
-    _update_status(status_callback, "Generating pose tracks (synthetic fallback)...", 15)
-    tracks = generate_synthetic_tracks(frame_count, fps, width, height, cancel_event)
+    _update_status(status_callback, "Running inference...", 15)
+    _update_info(info_callback, {"stage": "Running inference"})
+    tracks = generate_synthetic_tracks(frame_count, fps, width, height, cancel_event, info_callback)
     select_foreground_tracks(tracks)
 
     if not options.save_background_tracks:
@@ -221,6 +242,119 @@ def json_dumps(payload: dict[str, object]) -> str:
     return json.dumps(payload, indent=2)
 
 
+_SKELETON_CONNECTIONS = [
+    ("nose", "left_eye"),
+    ("nose", "right_eye"),
+    ("left_eye", "left_shoulder"),
+    ("right_eye", "right_shoulder"),
+    ("left_shoulder", "right_shoulder"),
+    ("left_shoulder", "left_elbow"),
+    ("right_shoulder", "right_elbow"),
+    ("left_elbow", "left_wrist"),
+    ("right_elbow", "right_wrist"),
+    ("left_shoulder", "left_hip"),
+    ("right_shoulder", "right_hip"),
+    ("left_hip", "right_hip"),
+    ("left_hip", "left_knee"),
+    ("right_hip", "right_knee"),
+    ("left_knee", "left_ankle"),
+    ("right_knee", "right_ankle"),
+]
+
+
+def _keypoints_to_map(keypoints: list[dict[str, object]]) -> dict[str, tuple[int, int, float]]:
+    mapped: dict[str, tuple[int, int, float]] = {}
+    for keypoint in keypoints:
+        name = str(keypoint.get("name", ""))
+        x = int(float(keypoint.get("x", 0)))
+        y = int(float(keypoint.get("y", 0)))
+        conf = float(keypoint.get("c", 0))
+        mapped[name] = (x, y, conf)
+    return mapped
+
+
+def _select_label_position(mapped: dict[str, tuple[int, int, float]]) -> tuple[int, int]:
+    if "nose" in mapped:
+        return mapped["nose"][0], mapped["nose"][1]
+    if "left_shoulder" in mapped and "right_shoulder" in mapped:
+        left = mapped["left_shoulder"]
+        right = mapped["right_shoulder"]
+        return int((left[0] + right[0]) / 2), int((left[1] + right[1]) / 2)
+    if "left_hip" in mapped and "right_hip" in mapped:
+        left = mapped["left_hip"]
+        right = mapped["right_hip"]
+        return int((left[0] + right[0]) / 2), int((left[1] + right[1]) / 2)
+    if mapped:
+        _, (x, y, _) = next(iter(mapped.items()))
+        return x, y
+    return 12, 12
+
+
+def _draw_pose_overlays(frame, frame_entries: list[dict[str, object]]) -> None:
+    if cv2 is None:
+        return
+    colors = [(0, 200, 255), (255, 200, 0), (180, 255, 120), (255, 120, 180)]
+    for idx, entry in enumerate(frame_entries):
+        keypoints = entry.get("keypoints_2d", [])
+        if not isinstance(keypoints, list):
+            continue
+        mapped = _keypoints_to_map(keypoints)
+        color = colors[idx % len(colors)]
+        for a, b in _SKELETON_CONNECTIONS:
+            if a in mapped and b in mapped:
+                ax, ay, ac = mapped[a]
+                bx, by, bc = mapped[b]
+                if ac > 0.1 and bc > 0.1:
+                    cv2.line(frame, (ax, ay), (bx, by), color, 2)
+        for _, (x, y, conf) in mapped.items():
+            if conf > 0.1:
+                cv2.circle(frame, (x, y), 3, color, -1)
+        label_x, label_y = _select_label_position(mapped)
+        track_id = str(entry.get("track_id", "track"))
+        cv2.putText(
+            frame,
+            track_id,
+            (label_x + 6, max(12, label_y - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def _draw_watermark(frame, frame_index: int, fps: float) -> None:
+    if cv2 is None:
+        return
+    timestamp_ms = int(frame_index / max(1.0, fps) * 1000)
+    watermark = f"FightingOverlay | frame {frame_index} | {timestamp_ms}ms"
+    cv2.putText(
+        frame,
+        watermark,
+        (10, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def _draw_no_pose(frame) -> None:
+    if cv2 is None:
+        return
+    cv2.putText(
+        frame,
+        "NO POSE",
+        (10, 48),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 0, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+
 def export_overlay_video(
     video_path: Path,
     output_path: Path,
@@ -230,11 +364,11 @@ def export_overlay_video(
     height: int,
     cancel_event: object | None = None,
     status_callback: StatusCallback | None = None,
+    info_callback: InfoCallback | None = None,
 ) -> None:
     if cv2 is None:
-        shutil.copyfile(video_path, output_path)
-        _update_status(status_callback, "Overlay export fallback: copied source video.", 90)
-        return
+        _update_status(status_callback, "Overlay export failed: OpenCV unavailable.", 90)
+        raise RuntimeError("OpenCV is required to export overlay video.")
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -243,14 +377,24 @@ def export_overlay_video(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
-    frame_map: dict[int, list[list[float]]] = {}
+    frame_map: dict[int, list[dict[str, object]]] = {}
     for track in tracks:
+        track_id = track.get("track_id", "unknown")
         for frame in track.get("frames", []):
-            bbox = frame.get("bbox_xywh")
-            frame_map.setdefault(int(frame["frame_index"]), []).append(bbox)
+            frame_map.setdefault(int(frame["frame_index"]), []).append(
+                {
+                    "track_id": track_id,
+                    "keypoints_2d": frame.get("keypoints_2d", []),
+                    "timestamp_ms": frame.get("timestamp_ms", 0),
+                }
+            )
 
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1)
     frame_index = 0
+    frames_with_pose = 0
+    frames_with_multiple = 0
+    start_time = time.time()
+    _update_info(info_callback, {"stage": "Rendering overlay"})
     while True:
         if cancel_event is not None and getattr(cancel_event, "is_set")():
             cap.release()
@@ -259,16 +403,54 @@ def export_overlay_video(
         ret, frame = cap.read()
         if not ret:
             break
-        for bbox in frame_map.get(frame_index, []):
-            x, y, w, h = [int(v) for v in bbox]
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 200, 255), 2)
-        writer.write(frame)
+        annotated = frame.copy()
+        frame_entries = frame_map.get(frame_index, [])
+        pose_count = len(frame_entries)
+        if pose_count >= 1:
+            frames_with_pose += 1
+        if pose_count >= 2:
+            frames_with_multiple += 1
+        _draw_watermark(annotated, frame_index, fps)
+        if not frame_entries:
+            _draw_no_pose(annotated)
+        else:
+            _draw_pose_overlays(annotated, frame_entries)
+        writer.write(annotated)
         frame_index += 1
-        if frame_index % 10 == 0:
+        if frame_index % 5 == 0 or frame_index == total:
             progress = 35 + (frame_index / max(1, total)) * 50
-            _update_status(status_callback, "Exporting overlay video...", progress)
+            elapsed = max(0.001, time.time() - start_time)
+            effective_fps = frame_index / elapsed
+            _update_status(
+                status_callback,
+                f"Rendering overlay frame {frame_index}/{total}...",
+                progress,
+            )
+            _update_info(
+                info_callback,
+                {
+                    "frame_index": frame_index,
+                    "total_frames": total,
+                    "people": pose_count,
+                    "effective_fps": effective_fps,
+                },
+            )
     cap.release()
     writer.release()
+    model_backend = "unknown"
+    if tracks:
+        source = tracks[0].get("source", {})
+        if isinstance(source, dict):
+            model_backend = str(source.get("backend", model_backend))
+    logging.info(
+        "Overlay export stats: total_frames=%s frames_with_pose>=1=%s frames_with_pose>=2=%s input_path=%s output_path=%s model_backend=%s",
+        frame_index,
+        frames_with_pose,
+        frames_with_multiple,
+        video_path,
+        output_path,
+        model_backend,
+    )
     _update_status(status_callback, "Overlay video exported.", 90)
 
 
@@ -310,11 +492,14 @@ def run_pipeline(
     options: ProcessingOptions,
     cancel_event: object | None = None,
     status_callback: StatusCallback | None = None,
+    info_callback: InfoCallback | None = None,
 ) -> Path:
     output_dir = get_outputs_root()
-    payload = run_inference(video_path, options, cancel_event, status_callback)
+    payload = run_inference(video_path, options, cancel_event, status_callback, info_callback)
 
     if options.save_pose_json:
+        _update_status(status_callback, "Writing JSON...", 80)
+        _update_info(info_callback, {"stage": "Writing JSON"})
         pose_path = write_pose_tracks(output_dir, payload)
     else:
         pose_path = output_dir / "pose_tracks.json"
@@ -329,12 +514,14 @@ def run_pipeline(
             int(payload["video"]["height"]),
             cancel_event,
             status_callback,
+            info_callback,
         )
 
     if video_path and options.save_thumbnails:
         save_thumbnails(video_path, output_dir / "thumbnails", cancel_event, status_callback)
 
-    _update_status(status_callback, "Processing complete.", 100)
+    _update_status(status_callback, "Done.", 100)
+    _update_info(info_callback, {"stage": "Done"})
     return pose_path
 
 

@@ -157,6 +157,11 @@ def main() -> None:
 
     selected_video = StringVar(value="No video selected")
     status_var = StringVar(value="Idle")
+    run_stage_var = StringVar(value="Idle")
+    frame_stats_var = StringVar(value="Frame -/-")
+    fps_var = StringVar(value="FPS: --")
+    people_var = StringVar(value="People: --")
+    error_var = StringVar(value="Last error: None")
 
     export_overlay_var = BooleanVar(value=True)
     save_pose_var = BooleanVar(value=True)
@@ -243,6 +248,7 @@ def main() -> None:
             messagebox.showerror("Validate Output", message)
 
     action_buttons: list[ttk.Button] = []
+    settings_controls: list[ttk.Widget] = []
 
     open_button = ttk.Button(run_tab, text="Open Video", style="Accent.TButton", command=on_open_video)
     open_button.grid(row=2, column=0, sticky="ew", padx=(0, 12))
@@ -255,18 +261,44 @@ def main() -> None:
 
     action_buttons.extend([open_button, run_button])
 
+    quick_actions = ttk.Frame(run_tab, padding=8, style="Card.TFrame")
+    quick_actions.grid(row=3, column=0, sticky="w", pady=(10, 0))
+    quick_actions.columnconfigure(0, weight=1)
+    quick_actions.columnconfigure(1, weight=1)
+
+    quick_outputs = ttk.Button(quick_actions, text="Open Outputs", command=on_open_outputs)
+    quick_logs = ttk.Button(quick_actions, text="Open Logs", command=on_open_logs)
+    quick_outputs.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    quick_logs.grid(row=0, column=1, sticky="ew")
+
     status_frame = ttk.Frame(run_tab, padding=12, style="Card.TFrame")
     status_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(16, 8))
     status_frame.columnconfigure(1, weight=1)
 
-    ttk.Label(status_frame, text="Status", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
-    ttk.Label(status_frame, textvariable=status_var, style="Card.TLabel").grid(row=0, column=1, sticky="w")
+    ttk.Label(status_frame, text="Run Status", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(status_frame, textvariable=run_stage_var, style="Card.TLabel").grid(row=0, column=1, sticky="w")
+
+    ttk.Label(status_frame, text="Details", style="Card.TLabel").grid(row=1, column=0, sticky="w")
+    ttk.Label(status_frame, textvariable=status_var, style="Card.TLabel").grid(row=1, column=1, sticky="w")
 
     progress = ttk.Progressbar(status_frame, mode="determinate", maximum=100)
-    progress.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+    progress.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+    stats_frame = ttk.Frame(status_frame, padding=(0, 8), style="Card.TFrame")
+    stats_frame.grid(row=3, column=0, columnspan=2, sticky="ew")
+    stats_frame.columnconfigure(1, weight=1)
+
+    ttk.Label(stats_frame, text="Frame", style="Card.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=frame_stats_var, style="Card.TLabel").grid(row=0, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Effective FPS", style="Card.TLabel").grid(row=1, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=fps_var, style="Card.TLabel").grid(row=1, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Last-frame people", style="Card.TLabel").grid(row=2, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=people_var, style="Card.TLabel").grid(row=2, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Last error", style="Card.TLabel").grid(row=3, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=error_var, style="Card.TLabel").grid(row=3, column=1, sticky="w")
 
     ttk.Label(status_frame, text="Last update: " + load_last_update(), style="Card.TLabel").grid(
-        row=2, column=0, columnspan=2, sticky="w", pady=(6, 0)
+        row=4, column=0, columnspan=2, sticky="w", pady=(6, 0)
     )
 
     data_tab.columnconfigure(0, weight=1)
@@ -274,13 +306,14 @@ def main() -> None:
     data_group = ttk.LabelFrame(data_tab, text="Output Options", padding=12)
     data_group.grid(row=0, column=0, sticky="ew")
 
-    ttk.Checkbutton(data_group, text="Save pose JSON", variable=save_pose_var).grid(row=0, column=0, sticky="w")
-    ttk.Checkbutton(data_group, text="Save thumbnails (1 per second)", variable=save_thumbnails_var).grid(
-        row=1, column=0, sticky="w"
+    save_pose_check = ttk.Checkbutton(data_group, text="Save pose JSON", variable=save_pose_var)
+    save_pose_check.grid(row=0, column=0, sticky="w")
+    save_thumbnails_check = ttk.Checkbutton(data_group, text="Save thumbnails (1 per second)", variable=save_thumbnails_var)
+    save_thumbnails_check.grid(row=1, column=0, sticky="w")
+    save_background_check = ttk.Checkbutton(
+        data_group, text="Save background tracks (track everyone)", variable=save_background_var
     )
-    ttk.Checkbutton(data_group, text="Save background tracks (track everyone)", variable=save_background_var).grid(
-        row=2, column=0, sticky="w"
-    )
+    save_background_check.grid(row=2, column=0, sticky="w")
 
     data_actions = ttk.Frame(data_tab, padding=12, style="Card.TFrame")
     data_actions.grid(row=1, column=0, sticky="ew", pady=(12, 0))
@@ -297,9 +330,8 @@ def main() -> None:
     settings_group = ttk.LabelFrame(settings_tab, text="Processing", padding=12)
     settings_group.grid(row=0, column=0, sticky="ew")
 
-    ttk.Checkbutton(settings_group, text="Export overlay video (MP4)", variable=export_overlay_var).grid(
-        row=0, column=0, sticky="w"
-    )
+    export_overlay_check = ttk.Checkbutton(settings_group, text="Export overlay video (MP4)", variable=export_overlay_var)
+    export_overlay_check.grid(row=0, column=0, sticky="w")
 
     ttk.Label(settings_group, text="Foreground selection mode").grid(row=1, column=0, sticky="w", pady=(8, 2))
     mode_combo = ttk.Combobox(
@@ -343,6 +375,16 @@ def main() -> None:
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logging.getLogger().addHandler(handler)
 
+    settings_controls.extend(
+        [
+            save_pose_check,
+            save_thumbnails_check,
+            save_background_check,
+            export_overlay_check,
+            mode_combo,
+        ]
+    )
+
     def set_running(running: bool) -> None:
         state = "disabled" if running else "normal"
         for button in action_buttons:
@@ -351,12 +393,32 @@ def main() -> None:
         logs_button.configure(state=state)
         updates_button.configure(state=state)
         update_now_button.configure(state=state)
+        quick_outputs.configure(state=state)
+        quick_logs.configure(state=state)
+        for widget in settings_controls:
+            if isinstance(widget, ttk.Combobox):
+                widget.configure(state="disabled" if running else "readonly")
+            else:
+                widget.configure(state=state)
         cancel_button.configure(state="normal" if running else "disabled")
 
     def update_status(message: str, progress_value: float | None = None) -> None:
         status_var.set(message)
         if progress_value is not None:
             progress["value"] = progress_value
+
+    def update_info(info: dict[str, object]) -> None:
+        stage = info.get("stage")
+        if stage:
+            run_stage_var.set(str(stage))
+        if "frame_index" in info and "total_frames" in info:
+            frame_stats_var.set(f"Frame {info['frame_index']} / {info['total_frames']}")
+        if "effective_fps" in info:
+            fps_var.set(f"FPS: {float(info['effective_fps']):.1f}")
+        if "people" in info:
+            people_var.set(f"People: {info['people']}")
+        if "error" in info:
+            error_var.set(f"Last error: {info['error']}")
 
     def on_run_overlay() -> None:
         if selected_video.get() == "No video selected":
@@ -369,9 +431,17 @@ def main() -> None:
         cancel_event.clear()
         set_running(True)
         update_status("Starting processing...", 0)
+        run_stage_var.set("Loading video")
+        frame_stats_var.set("Frame -/-")
+        fps_var.set("FPS: --")
+        people_var.set("People: --")
+        error_var.set("Last error: None")
 
         def status_callback(message: str, progress_value: float | None) -> None:
             root.after(0, update_status, message, progress_value)
+
+        def info_callback(info: dict[str, object]) -> None:
+            root.after(0, update_info, info)
 
         def run_background() -> None:
             try:
@@ -390,14 +460,17 @@ def main() -> None:
                     options,
                     cancel_event,
                     status_callback,
+                    info_callback,
                 )
                 logging.info("Processing finished. Output: %s", pose_path)
                 root.after(0, messagebox.showinfo, "Run Overlay", "Processing complete.")
             except ProcessingCancelled:
                 logging.warning("Processing cancelled by user.")
                 root.after(0, update_status, "Processing cancelled.", 0)
+                root.after(0, update_info, {"stage": "Cancelled"})
             except Exception as exc:
                 logging.exception("Processing failed: %s", exc)
+                root.after(0, update_info, {"error": exc, "stage": "Failed"})
                 root.after(0, messagebox.showerror, "Run Overlay", f"Processing failed: {exc}")
                 root.after(0, update_status, "Processing failed.", 0)
             finally:
