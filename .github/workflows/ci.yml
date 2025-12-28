@@ -18,13 +18,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller
+          python -m pip install -r requirements/ci.txt
       - name: Build bootstrapper
         run: |
           pyinstaller --onefile --name FightingOverlayBootstrap bootstrap/main.py
       - name: Build Control Center
         run: |
-          pyinstaller --onedir --name ControlCenter apps/control_center/main.py
+          pyinstaller --onedir --name ControlCenter --collect-all cv2 apps/control_center/main.py
       - name: Diagnose build outputs
         run: |
           pwsh -Command "Get-ChildItem -Recurse -Force dist, release_assets, package_root, apps, . | Select-Object FullName, Length"

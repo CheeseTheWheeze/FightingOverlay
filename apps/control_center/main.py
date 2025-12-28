@@ -53,6 +53,26 @@ def setup_logging() -> None:
     )
 
 
+def check_opencv(show_dialog: bool) -> bool:
+    try:
+        import cv2  # type: ignore
+    except ImportError:
+        message = (
+            "OpenCV (cv2) is missing from this build. Please update or reinstall "
+            "FightingOverlay using the latest release so OpenCV is bundled."
+        )
+        logging.error(message)
+        if show_dialog:
+            root = Tk()
+            root.withdraw()
+            messagebox.showerror("Missing OpenCV", message, parent=root)
+            root.destroy()
+        return False
+    version = getattr(cv2, "__version__", "unknown")
+    logging.info("OpenCV detected (cv2 version %s).", version)
+    return True
+
+
 def get_current_version() -> str:
     pointer = get_current_pointer()
     if not pointer.exists():
@@ -138,6 +158,8 @@ def main() -> None:
     args = parser.parse_args()
 
     setup_logging()
+    if not check_opencv(show_dialog=not args.test_mode):
+        return
 
     if args.test_mode:
         options = ProcessingOptions(
