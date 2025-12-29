@@ -152,6 +152,14 @@ def configure_dark_theme(root: Tk) -> None:
     style.configure("TProgressbar", troughcolor=surface, background=accent)
 
 
+def format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="FightingOverlay Control Center")
     parser.add_argument("--test-mode", action="store_true", help="Run synthetic test and exit")
@@ -181,8 +189,13 @@ def main() -> None:
     status_var = StringVar(value="Idle")
     run_stage_var = StringVar(value="Idle")
     frame_stats_var = StringVar(value="Frame -/-")
-    fps_var = StringVar(value="FPS: --")
+    fps_var = StringVar(value="Processed FPS: --")
+    source_fps_var = StringVar(value="Source FPS: --")
+    resolution_var = StringVar(value="Resolution: --")
+    duration_var = StringVar(value="Duration: --")
+    inference_var = StringVar(value="Inference: --")
     people_var = StringVar(value="People: --")
+    realtime_var = StringVar(value="Realtime: --")
     error_var = StringVar(value="Last error: None")
 
     export_overlay_var = BooleanVar(value=True)
@@ -317,12 +330,22 @@ def main() -> None:
 
     ttk.Label(stats_frame, text="Frame", style="Card.TLabel").grid(row=0, column=0, sticky="w")
     ttk.Label(stats_frame, textvariable=frame_stats_var, style="Card.TLabel").grid(row=0, column=1, sticky="w")
-    ttk.Label(stats_frame, text="Effective FPS", style="Card.TLabel").grid(row=1, column=0, sticky="w")
-    ttk.Label(stats_frame, textvariable=fps_var, style="Card.TLabel").grid(row=1, column=1, sticky="w")
-    ttk.Label(stats_frame, text="Last-frame people", style="Card.TLabel").grid(row=2, column=0, sticky="w")
-    ttk.Label(stats_frame, textvariable=people_var, style="Card.TLabel").grid(row=2, column=1, sticky="w")
-    ttk.Label(stats_frame, text="Last error", style="Card.TLabel").grid(row=3, column=0, sticky="w")
-    ttk.Label(stats_frame, textvariable=error_var, style="Card.TLabel").grid(row=3, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Resolution", style="Card.TLabel").grid(row=1, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=resolution_var, style="Card.TLabel").grid(row=1, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Duration", style="Card.TLabel").grid(row=2, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=duration_var, style="Card.TLabel").grid(row=2, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Source FPS", style="Card.TLabel").grid(row=3, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=source_fps_var, style="Card.TLabel").grid(row=3, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Processed FPS", style="Card.TLabel").grid(row=4, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=fps_var, style="Card.TLabel").grid(row=4, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Realtime", style="Card.TLabel").grid(row=5, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=realtime_var, style="Card.TLabel").grid(row=5, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Inference", style="Card.TLabel").grid(row=6, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=inference_var, style="Card.TLabel").grid(row=6, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Last-frame people", style="Card.TLabel").grid(row=7, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=people_var, style="Card.TLabel").grid(row=7, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Last error", style="Card.TLabel").grid(row=8, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=error_var, style="Card.TLabel").grid(row=8, column=1, sticky="w")
 
     ttk.Label(status_frame, text="Last update: " + load_last_update(), style="Card.TLabel").grid(
         row=4, column=0, columnspan=2, sticky="w", pady=(6, 0)
@@ -476,9 +499,36 @@ def main() -> None:
         if "frame_index" in info and "total_frames" in info:
             frame_stats_var.set(f"Frame {info['frame_index']} / {info['total_frames']}")
         if "effective_fps" in info:
-            fps_var.set(f"FPS: {float(info['effective_fps']):.1f}")
+            fps_var.set(f"{float(info['effective_fps']):.1f} fps")
+        if "realtime_ratio" in info:
+            realtime_var.set(f"{float(info['realtime_ratio']):.2f}x realtime")
         if "people" in info:
             people_var.set(f"People: {info['people']}")
+        if "video_width" in info and "video_height" in info:
+            width = int(info["video_width"])
+            height = int(info["video_height"])
+            mp = (width * height) / 1_000_000
+            resolution_var.set(f"{width} x {height} ({mp:.2f} MP)")
+        if "video_duration_s" in info:
+            duration_var.set(format_duration(float(info["video_duration_s"])))
+        if "video_fps" in info:
+            source_fps_var.set(f"{float(info['video_fps']):.1f} fps")
+        if "infer_width" in info or "infer_height" in info:
+            infer_w = info.get("infer_width")
+            infer_h = info.get("infer_height")
+            resized_w = info.get("resized_width")
+            resized_h = info.get("resized_height")
+            pad_left = info.get("pad_left")
+            pad_right = info.get("pad_right")
+            pad_top = info.get("pad_top")
+            pad_bottom = info.get("pad_bottom")
+            transform_kind = info.get("transform_kind")
+            inference_var.set(
+                f"{transform_kind} infer={infer_w}x{infer_h} resized={resized_w}x{resized_h} "
+                f"pads L{pad_left} R{pad_right} T{pad_top} B{pad_bottom}"
+            )
+        if info.get("mapping_warning"):
+            error_var.set("Mapping warning: keypoints out of bounds")
         if "error" in info:
             error_var.set(f"Last error: {info['error']}")
 
@@ -495,8 +545,13 @@ def main() -> None:
         update_status("Starting processing...", 0)
         run_stage_var.set("Loading video")
         frame_stats_var.set("Frame -/-")
-        fps_var.set("FPS: --")
+        fps_var.set("Processed FPS: --")
+        source_fps_var.set("Source FPS: --")
+        resolution_var.set("Resolution: --")
+        duration_var.set("Duration: --")
+        inference_var.set("Inference: --")
         people_var.set("People: --")
+        realtime_var.set("Realtime: --")
         error_var.set("Last error: None")
 
         def status_callback(message: str, progress_value: float | None) -> None:
