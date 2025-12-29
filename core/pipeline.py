@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -484,6 +485,65 @@ def json_dumps(payload: dict[str, object]) -> str:
     import json
 
     return json.dumps(payload, indent=2)
+
+
+def _summarize_tracks(payload: dict[str, object]) -> dict[str, float | int]:
+    video = payload.get("video", {}) if isinstance(payload, dict) else {}
+    total_frames = int(video.get("frame_count", 0) or 0)
+    tracks = payload.get("tracks", []) if isinstance(payload, dict) else []
+    track_lengths = []
+    frame_presence: dict[int, int] = {}
+    if isinstance(tracks, list):
+        for track in tracks:
+            frames = track.get("frames", []) if isinstance(track, dict) else []
+            if not isinstance(frames, list):
+                continue
+            track_lengths.append(len(frames))
+            for frame in frames:
+                if not isinstance(frame, dict):
+                    continue
+                frame_index = int(frame.get("frame_index", -1))
+                if frame_index >= 0:
+                    frame_presence[frame_index] = frame_presence.get(frame_index, 0) + 1
+    if total_frames <= 0 and frame_presence:
+        total_frames = max(frame_presence.keys()) + 1
+    frames_with_pose = sum(1 for count in frame_presence.values() if count >= 1)
+    frames_with_multiple = sum(1 for count in frame_presence.values() if count >= 2)
+    avg_track_length = sum(track_lengths) / len(track_lengths) if track_lengths else 0.0
+    pose_ratio = frames_with_pose / total_frames if total_frames else 0.0
+    return {
+        "track_count": len(tracks) if isinstance(tracks, list) else 0,
+        "avg_track_length": avg_track_length,
+        "total_frames": total_frames,
+        "frames_with_pose": frames_with_pose,
+        "frames_with_multiple": frames_with_multiple,
+        "pose_ratio": pose_ratio,
+    }
+
+
+def _write_debug_pack_manifest(
+    output_root: Path,
+    step: str,
+    exception_info: dict[str, str] | None,
+    overlay_stats: dict[str, object] | None,
+    evaluation_stats: dict[str, object] | None,
+    track_summary: dict[str, float | int] | None,
+    problems: list[dict[str, object]] | None,
+    debug_pack_info: dict[str, object] | None,
+) -> None:
+    output_root.mkdir(parents=True, exist_ok=True)
+    report = {
+        "status": "failed" if exception_info else "success",
+        "failed_step": step if exception_info else None,
+        "exception": exception_info,
+        "overlay_stats": overlay_stats,
+        "evaluation_stats": evaluation_stats,
+        "track_summary": track_summary,
+        "problems": problems or [],
+        "debug_pack": debug_pack_info,
+        "written_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    (output_root / "debug_pack_report.json").write_text(json_dumps(report), encoding="utf-8")
 
 
 _SKELETON_15_NAMES = KEYPOINT_NAMES
@@ -1350,9 +1410,15 @@ def _write_debug_pack(
     track_transforms: dict[str, dict[str, float | str]],
     selected_frames: list[dict[str, object]],
     min_keypoint_confidence: float,
-) -> None:
-    if cv2 is None or not selected_frames:
-        return
+) -> dict[str, object]:
+    if cv2 is None:
+        return {
+            "status": "skipped",
+            "reason": "opencv_unavailable",
+            "path": None,
+            "frame_count": 0,
+            "file_count": 0,
+        }
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     pack_dir = output_root / f"debug_pack_{timestamp}"
     pack_dir.mkdir(parents=True, exist_ok=True)
@@ -1364,7 +1430,21 @@ def _write_debug_pack(
             "width": width,
             "height": height,
         },
+        "note": "Empty selection; no frames captured." if not selected_frames else None,
     }
+    if not selected_frames:
+        (pack_dir / "debug_pack_report.json").write_text(json_dumps(report), encoding="utf-8")
+        (pack_dir / "README.txt").write_text(
+            "FightingOverlay Debug Pack\n\nNo frames were selected for capture.\n",
+            encoding="utf-8",
+        )
+        return {
+            "status": "empty",
+            "path": str(pack_dir),
+            "report": str(pack_dir / "debug_pack_report.json"),
+            "frame_count": 0,
+            "file_count": len(list(pack_dir.glob("*"))),
+        }
     cap = cv2.VideoCapture(str(video_path))
     frame_lookup = {int(item["frame_index"]): item for item in selected_frames}
     frame_index = 0
@@ -1492,6 +1572,13 @@ def _write_debug_pack(
         "See debug_pack_report.json for keypoint metadata.",
     ]
     (pack_dir / "README.txt").write_text("\n".join(readme_lines), encoding="utf-8")
+    return {
+        "status": "written",
+        "path": str(pack_dir),
+        "report": str(pack_dir / "debug_pack_report.json"),
+        "frame_count": len(report["frames"]),
+        "file_count": len(list(pack_dir.glob("*"))),
+    }
 
 
 def export_overlay_video(
@@ -1515,7 +1602,7 @@ def export_overlay_video(
     cancel_event: object | None = None,
     status_callback: StatusCallback | None = None,
     info_callback: InfoCallback | None = None,
-) -> None:
+) -> dict[str, object]:
     if cv2 is None:
         _update_status(status_callback, "Overlay export failed: OpenCV unavailable.", 90)
         raise RuntimeError("OpenCV is required to export overlay video.")
@@ -2083,9 +2170,10 @@ def export_overlay_video(
             )
     cap.release()
     writer.release()
-    if generate_debug_pack and debug_pack_candidates:
+    debug_pack_info: dict[str, object] | None = None
+    if generate_debug_pack:
         selected = _select_debug_pack_frames(debug_pack_candidates)
-        _write_debug_pack(
+        debug_pack_info = _write_debug_pack(
             video_path,
             get_outputs_root(),
             fps,
@@ -2111,6 +2199,15 @@ def export_overlay_video(
         model_backend,
     )
     _update_status(status_callback, "Overlay video exported.", 90)
+    return {
+        "total_frames": frame_index,
+        "frames_with_pose": frames_with_pose,
+        "frames_with_multiple": frames_with_multiple,
+        "input_path": str(video_path),
+        "output_path": str(output_path),
+        "model_backend": model_backend,
+        "debug_pack": debug_pack_info,
+    }
 
 
 def save_thumbnails(
@@ -2154,123 +2251,170 @@ def run_pipeline(
     info_callback: InfoCallback | None = None,
 ) -> Path:
     output_dir = get_outputs_root()
-    payload = run_inference(video_path, options, cancel_event, status_callback, info_callback)
+    current_step = "start"
+    overlay_stats: dict[str, object] | None = None
+    evaluation_stats: dict[str, object] | None = None
+    track_summary: dict[str, float | int] | None = None
+    debug_pack_info: dict[str, object] | None = None
+    problems: list[dict[str, object]] = []
 
-    if options.save_pose_json:
-        _update_status(status_callback, "Writing JSON...", 80)
-        _update_info(info_callback, {"stage": "Writing JSON"})
-        pose_path = write_pose_tracks(output_dir, payload)
-    else:
-        pose_path = output_dir / "pose_tracks.json"
+    def _info_callback(info: dict[str, object]) -> None:
+        if "problem" in info and isinstance(info["problem"], dict):
+            problems.append(info["problem"])
+        if info_callback:
+            info_callback(info)
 
-    if options.save_combat_overlay:
-        from fightai.combat.derive import derive_combat_overlay
+    exception_info: dict[str, str] | None = None
 
-        _update_status(status_callback, "Deriving combat overlay...", 82)
-        combat_path = output_dir / "combat_overlay.json"
-        derive_combat_overlay(payload, combat_path)
-        _update_info(info_callback, {"combat_overlay_json": str(combat_path)})
+    try:
+        current_step = "inference"
+        payload = run_inference(video_path, options, cancel_event, status_callback, _info_callback)
+        track_summary = _summarize_tracks(payload)
 
-    if video_path and options.export_overlay_video:
-        overlay_variants = [
-            ("overlay_skeleton.mp4", "skeleton", False),
-            ("overlay_joints.mp4", "joints", False),
-            ("overlay_balance.mp4", "balance", False),
-            ("overlay_combat.mp4", "combat", False),
-        ]
-        if options.debug_overlay:
-            overlay_variants.append(("overlay_debug.mp4", "debug", True))
-        preview_mode = options.overlay_mode
-        known_modes = {variant[1] for variant in overlay_variants}
-        if preview_mode not in known_modes:
-            preview_mode = "skeleton"
-        for filename, mode, draw_bboxes in overlay_variants:
-            export_overlay_video(
-                video_path,
-                output_dir / filename,
-                payload["tracks"],
-                float(payload["video"]["fps"]),
-                int(payload["video"]["width"]),
-                int(payload["video"]["height"]),
-                debug_overlay=options.debug_overlay,
-                draw_all_tracks=options.draw_all_tracks,
-                smoothing_alpha=options.smoothing_alpha,
-                smoothing_enabled=options.smoothing_enabled,
-                min_keypoint_confidence=options.min_keypoint_confidence,
-                overlay_mode=mode,
-                max_tracks=options.max_tracks,
-                track_sort=options.track_sort,
-                live_preview=options.live_preview and mode == preview_mode,
-                draw_bboxes=draw_bboxes,
-                generate_debug_pack=options.debug_overlay and mode == "debug",
-                cancel_event=cancel_event,
-                status_callback=status_callback,
-                info_callback=info_callback,
+        if options.save_pose_json:
+            _update_status(status_callback, "Writing JSON...", 80)
+            _update_info(_info_callback, {"stage": "Writing JSON"})
+            current_step = "write_pose_json"
+            pose_path = write_pose_tracks(output_dir, payload)
+        else:
+            pose_path = output_dir / "pose_tracks.json"
+
+        if options.save_combat_overlay:
+            from fightai.combat.derive import derive_combat_overlay
+
+            _update_status(status_callback, "Deriving combat overlay...", 82)
+            current_step = "combat_overlay"
+            combat_path = output_dir / "combat_overlay.json"
+            derive_combat_overlay(payload, combat_path)
+            _update_info(_info_callback, {"combat_overlay_json": str(combat_path)})
+
+        if video_path and options.export_overlay_video:
+            overlay_variants = [
+                ("overlay_skeleton.mp4", "skeleton", False),
+                ("overlay_joints.mp4", "joints", False),
+                ("overlay_balance.mp4", "balance", False),
+                ("overlay_combat.mp4", "combat", False),
+            ]
+            if options.debug_overlay:
+                overlay_variants.append(("overlay_debug.mp4", "debug", True))
+            preview_mode = options.overlay_mode
+            known_modes = {variant[1] for variant in overlay_variants}
+            if preview_mode not in known_modes:
+                preview_mode = "skeleton"
+            for filename, mode, draw_bboxes in overlay_variants:
+                current_step = f"overlay_{mode}"
+                overlay_stats = export_overlay_video(
+                    video_path,
+                    output_dir / filename,
+                    payload["tracks"],
+                    float(payload["video"]["fps"]),
+                    int(payload["video"]["width"]),
+                    int(payload["video"]["height"]),
+                    debug_overlay=options.debug_overlay,
+                    draw_all_tracks=options.draw_all_tracks,
+                    smoothing_alpha=options.smoothing_alpha,
+                    smoothing_enabled=options.smoothing_enabled,
+                    min_keypoint_confidence=options.min_keypoint_confidence,
+                    overlay_mode=mode,
+                    max_tracks=options.max_tracks,
+                    track_sort=options.track_sort,
+                    live_preview=options.live_preview and mode == preview_mode,
+                    draw_bboxes=draw_bboxes,
+                    generate_debug_pack=options.debug_overlay and mode == "debug",
+                    cancel_event=cancel_event,
+                    status_callback=status_callback,
+                    info_callback=_info_callback,
+                )
+                debug_pack_info = overlay_stats.get("debug_pack") if overlay_stats else debug_pack_info
+            skeleton_path = output_dir / "overlay_skeleton.mp4"
+            legacy_path = output_dir / "overlay.mp4"
+            if skeleton_path.exists():
+                try:
+                    import shutil
+
+                    shutil.copy2(skeleton_path, legacy_path)
+                except OSError as exc:
+                    logging.warning("Failed to write legacy overlay.mp4: %s", exc)
+
+        if video_path and options.save_thumbnails:
+            current_step = "thumbnails"
+            save_thumbnails(video_path, output_dir / "thumbnails", cancel_event, status_callback)
+
+        if options.run_evaluation:
+            from core.evaluation import write_evaluation_report
+
+            _update_status(status_callback, "Evaluating tracking quality...", 95)
+            _update_info(_info_callback, {"stage": "Evaluating tracks"})
+            current_step = "evaluation"
+            json_path, text_path, results = write_evaluation_report(payload)
+            evaluation_stats = results
+            summary = (
+                f"Tracks={results['tracks']['count']} "
+                f"AvgLen={results['tracks']['avg_track_length']:.1f} "
+                f"Frames>=1={results['frames']['with_pose']}/{results['frames']['total']} "
+                f"Frames>=2={results['frames']['with_multiple']}/{results['frames']['total']} "
+                f"Conf={results['keypoints']['avg_confidence']:.2f} "
+                f"COMJitter={results['jitter']['center_of_mass_avg_px']:.1f}px"
             )
-        skeleton_path = output_dir / "overlay_skeleton.mp4"
-        legacy_path = output_dir / "overlay.mp4"
-        if skeleton_path.exists():
-            try:
-                import shutil
-
-                shutil.copy2(skeleton_path, legacy_path)
-            except OSError as exc:
-                logging.warning("Failed to write legacy overlay.mp4: %s", exc)
-
-    if video_path and options.save_thumbnails:
-        save_thumbnails(video_path, output_dir / "thumbnails", cancel_event, status_callback)
-
-    if options.run_evaluation:
-        from core.evaluation import write_evaluation_report
-
-        _update_status(status_callback, "Evaluating tracking quality...", 95)
-        _update_info(info_callback, {"stage": "Evaluating tracks"})
-        json_path, text_path, results = write_evaluation_report(payload)
-        summary = (
-            f"Tracks={results['tracks']['count']} "
-            f"AvgLen={results['tracks']['avg_track_length']:.1f} "
-            f"Frames>=1={results['frames']['with_pose']}/{results['frames']['total']} "
-            f"Frames>=2={results['frames']['with_multiple']}/{results['frames']['total']} "
-            f"Conf={results['keypoints']['avg_confidence']:.2f} "
-            f"COMJitter={results['jitter']['center_of_mass_avg_px']:.1f}px"
-        )
-        _update_info(
-            info_callback,
-            {
-                "evaluation_summary": summary,
-                "evaluation_json": str(json_path),
-                "evaluation_text": str(text_path),
-                "evaluation_stats": results,
-            },
-        )
-        pose_ratio = float(results.get("frames", {}).get("pose_ratio", 0.0) or 0.0)
-        if pose_ratio < 0.4:
             _update_info(
-                info_callback,
+                _info_callback,
                 {
-                    "evaluation_warning": (
-                        "Low pose coverage detected. Try lowering the confidence threshold "
-                        "or enable diagnostic mode for troubleshooting."
-                    )
+                    "evaluation_summary": summary,
+                    "evaluation_json": str(json_path),
+                    "evaluation_text": str(text_path),
+                    "evaluation_stats": results,
                 },
             )
+            pose_ratio = float(results.get("frames", {}).get("pose_ratio", 0.0) or 0.0)
+            if pose_ratio < 0.4:
+                _update_info(
+                    _info_callback,
+                    {
+                        "evaluation_warning": (
+                            "Low pose coverage detected. Try lowering the confidence threshold "
+                            "or enable diagnostic mode for troubleshooting."
+                        )
+                    },
+                )
 
-    if options.run_judge and video_path:
-        from fightai.judge.runner import run_judge
+        if options.run_judge and video_path:
+            from fightai.judge.runner import run_judge
 
-        _update_status(status_callback, "Running alignment judge...", 97)
-        overlay_path = output_dir / "overlay_skeleton.mp4"
-        judge_output = run_judge(
-            raw_video=video_path,
-            tracks_json=pose_path,
-            output_dir=output_dir,
-            overlay_video=overlay_path if overlay_path.exists() else None,
-        )
-        _update_info(info_callback, {"judge_output": judge_output})
+            _update_status(status_callback, "Running alignment judge...", 97)
+            current_step = "judge"
+            overlay_path = output_dir / "overlay_skeleton.mp4"
+            judge_output = run_judge(
+                raw_video=video_path,
+                tracks_json=pose_path,
+                output_dir=output_dir,
+                overlay_video=overlay_path if overlay_path.exists() else None,
+            )
+            _update_info(_info_callback, {"judge_output": judge_output})
 
-    _update_status(status_callback, "Done.", 100)
-    _update_info(info_callback, {"stage": "Done"})
-    return pose_path
+        _update_status(status_callback, "Done.", 100)
+        _update_info(_info_callback, {"stage": "Done"})
+        return pose_path
+    except Exception as exc:
+        exception_info = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        raise
+    finally:
+        try:
+            _write_debug_pack_manifest(
+                output_dir,
+                current_step,
+                exception_info,
+                overlay_stats,
+                evaluation_stats,
+                track_summary,
+                problems,
+                debug_pack_info,
+            )
+        except Exception as manifest_exc:
+            logging.warning("Failed to write debug pack manifest: %s", manifest_exc)
 
 
 __all__ = [
