@@ -51,7 +51,7 @@ def evaluate_pose_payload(payload: dict[str, Any]) -> dict[str, Any]:
             if frame_index >= 0:
                 frame_presence[frame_index] = frame_presence.get(frame_index, 0) + 1
             try:
-                mapped, _, _, _, normalized = _convert_keypoints(keypoints, transform)
+                mapped, _, _, _, _, normalized = _convert_keypoints(keypoints, transform)
             except ValueError as exc:
                 logging.warning("Skipping invalid keypoints during evaluation: %s", exc)
                 continue
