@@ -1593,9 +1593,7 @@ def export_overlay_video(
     mode_balance = "balance" in overlay_mode_normalized
     mode_joints = "joints" in overlay_mode_normalized or "dots" in overlay_mode_normalized
     mode_skeleton = "skeleton" in overlay_mode_normalized or "lines" in overlay_mode_normalized
-    if mode_debug:
-        mode_joints = True
-    draw_lines = mode_skeleton
+    draw_lines = mode_skeleton or (mode_debug and not mode_joints)
     draw_joints = mode_skeleton or mode_joints or mode_debug
     draw_balance = mode_balance
     show_labels = mode_debug
