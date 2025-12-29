@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -485,10 +486,6 @@ def json_dumps(payload: dict[str, object]) -> str:
 
 _SKELETON_15_NAMES = KEYPOINT_NAMES
 _SKELETON_15_CONNECTIONS = [
-    ("nose", "left_eye"),
-    ("nose", "right_eye"),
-    ("left_eye", "left_shoulder"),
-    ("right_eye", "right_shoulder"),
     ("left_shoulder", "right_shoulder"),
     ("left_shoulder", "left_elbow"),
     ("right_shoulder", "right_elbow"),
@@ -501,6 +498,8 @@ _SKELETON_15_CONNECTIONS = [
     ("right_hip", "right_knee"),
     ("left_knee", "left_ankle"),
     ("right_knee", "right_ankle"),
+    ("nose", "left_shoulder"),
+    ("nose", "right_shoulder"),
 ]
 
 _COCO_KEYPOINT_NAMES = [
@@ -524,10 +523,6 @@ _COCO_KEYPOINT_NAMES = [
 ]
 
 _COCO_SKELETON_CONNECTIONS = [
-    ("nose", "left_eye"),
-    ("nose", "right_eye"),
-    ("left_eye", "left_ear"),
-    ("right_eye", "right_ear"),
     ("left_shoulder", "right_shoulder"),
     ("left_shoulder", "left_elbow"),
     ("right_shoulder", "right_elbow"),
@@ -540,6 +535,8 @@ _COCO_SKELETON_CONNECTIONS = [
     ("right_hip", "right_knee"),
     ("left_knee", "left_ankle"),
     ("right_knee", "right_ankle"),
+    ("nose", "left_shoulder"),
+    ("nose", "right_shoulder"),
 ]
 
 _KEYPOINT_LAYOUTS = {
@@ -552,11 +549,18 @@ def _inspect_keypoints(keypoints: list[object]) -> dict[str, object]:
     if not isinstance(keypoints, list):
         raise ValueError("keypoints must be a list.")
     if not keypoints:
-        return {"count": 0, "stride": 0, "shape": "(0,)", "raw_samples": [], "names_in_data": []}
+        return {
+            "count": 0,
+            "stride": 0,
+            "shape": "(0,)",
+            "raw_samples": [],
+            "names_in_data": [],
+            "representation": "unknown",
+        }
     if all(isinstance(item, dict) for item in keypoints):
         samples = []
         names = []
-        for idx, item in enumerate(keypoints[:3]):
+        for idx, item in enumerate(keypoints[:5]):
             samples.append(
                 {
                     "idx": idx,
@@ -575,9 +579,11 @@ def _inspect_keypoints(keypoints: list[object]) -> dict[str, object]:
             "shape": f"({len(keypoints)}, dict)",
             "raw_samples": samples,
             "names_in_data": names,
+            "representation": "Kx3",
         }
     if all(isinstance(item, (int, float)) for item in keypoints):
         flat = [float(item) for item in keypoints]
+        raw_flat = list(keypoints)
         if len(flat) % 3 == 0:
             stride = 3
         elif len(flat) % 2 == 0:
@@ -585,18 +591,21 @@ def _inspect_keypoints(keypoints: list[object]) -> dict[str, object]:
         else:
             raise ValueError("Flat keypoint list must be divisible by 2 or 3.")
         samples = []
-        for idx in range(0, min(len(flat), stride * 3), stride):
+        for idx in range(0, min(len(flat), stride * 5), stride):
             kp_index = idx // stride
-            x = flat[idx]
-            y = flat[idx + 1]
-            c = flat[idx + 2] if stride == 3 else 1.0
-            samples.append({"idx": kp_index, "x": x, "y": y, "c": c})
+            x = raw_flat[idx]
+            y = raw_flat[idx + 1]
+            if stride == 3:
+                samples.append({"idx": kp_index, "x": x, "y": y, "c": raw_flat[idx + 2]})
+            else:
+                samples.append({"idx": kp_index, "x": x, "y": y})
         return {
             "count": len(flat) // stride,
             "stride": stride,
             "shape": f"({len(flat)},)",
             "raw_samples": samples,
             "names_in_data": [],
+            "representation": "flat",
         }
     if all(isinstance(item, (list, tuple)) for item in keypoints):
         lengths = {len(item) for item in keypoints}
@@ -606,15 +615,18 @@ def _inspect_keypoints(keypoints: list[object]) -> dict[str, object]:
             raise ValueError("Keypoint rows must be consistently length 2 or 3.")
         row_len = next(iter(lengths))
         samples = []
-        for idx, row in enumerate(keypoints[:3]):
-            c = float(row[2]) if row_len == 3 else 1.0
-            samples.append({"idx": idx, "x": row[0], "y": row[1], "c": c})
+        for idx, row in enumerate(keypoints[:5]):
+            if row_len == 3:
+                samples.append({"idx": idx, "x": row[0], "y": row[1], "c": row[2]})
+            else:
+                samples.append({"idx": idx, "x": row[0], "y": row[1]})
         return {
             "count": len(keypoints),
             "stride": row_len,
             "shape": f"({len(keypoints)}, {row_len})",
             "raw_samples": samples,
             "names_in_data": [],
+            "representation": f"Kx{row_len}",
         }
     raise ValueError("Unsupported keypoint format.")
 
@@ -851,15 +863,28 @@ def _convert_xy(x: float, y: float, transform: dict[str, float | str]) -> tuple[
 def _convert_keypoints(
     keypoints: list[object],
     transform: dict[str, float | str],
-) -> tuple[dict[str, tuple[int, int, float]], dict[str, object], str | None, list[tuple[str, str]], list[dict[str, float | str]]]:
+) -> tuple[
+    dict[str, tuple[int, int, float]],
+    list[tuple[int, str, int, int, float]],
+    dict[str, object],
+    str | None,
+    list[tuple[str, str]],
+    list[dict[str, float | str]],
+]:
     keypoint_info = _inspect_keypoints(keypoints)
     layout_name, layout_names, skeleton = _resolve_keypoint_layout(keypoint_info)
     normalized = _normalize_keypoints(keypoints, layout_names)
     mapped: dict[str, tuple[int, int, float]] = {}
-    for kp in normalized:
+    mapped_ordered: list[tuple[int, str, int, int, float]] = []
+    for idx, kp in enumerate(normalized):
         x, y = _convert_xy(float(kp["x"]), float(kp["y"]), transform)
-        mapped[str(kp["name"])] = (int(round(x)), int(round(y)), float(kp["c"]))
-    return mapped, keypoint_info, layout_name, skeleton, normalized
+        name = str(kp["name"])
+        mapped_x = int(round(x))
+        mapped_y = int(round(y))
+        conf = float(kp["c"])
+        mapped[name] = (mapped_x, mapped_y, conf)
+        mapped_ordered.append((idx, name, mapped_x, mapped_y, conf))
+    return mapped, mapped_ordered, keypoint_info, layout_name, skeleton, normalized
 
 
 def _convert_bbox(
@@ -1055,6 +1080,52 @@ def _draw_keypoint_labels(
             break
 
 
+def _draw_joint_index_labels(
+    frame,
+    mapped_ordered: list[tuple[int, str, int, int, float]],
+    color: tuple[int, int, int],
+    min_confidence: float,
+) -> None:
+    if cv2 is None or not mapped_ordered:
+        return
+    for idx, _, x, y, conf in mapped_ordered:
+        if conf < min_confidence:
+            continue
+        cv2.putText(
+            frame,
+            str(idx),
+            (x + 6, y - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def _draw_forensics_stamp(
+    frame,
+    lines: list[str],
+    origin: tuple[int, int] = (10, 64),
+    color: tuple[int, int, int] = (255, 255, 255),
+) -> None:
+    if cv2 is None:
+        return
+    x, y = origin
+    for line in lines:
+        cv2.putText(
+            frame,
+            line,
+            (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+        y += 16
+
+
 def _draw_bbox(frame, bbox_xywh: tuple[int, int, int, int], color: tuple[int, int, int]) -> None:
     if cv2 is None:
         return
@@ -1094,6 +1165,29 @@ def _center_of_mass(mapped: dict[str, tuple[int, int, float]], min_confidence: f
     return int(round(sum(xs) / len(xs))), int(round(sum(ys) / len(ys)))
 
 
+def _bbox_from_points(
+    mapped: dict[str, tuple[int, int, float]],
+    min_confidence: float,
+) -> tuple[int, int, int, int] | None:
+    if not mapped:
+        return None
+    xs = [x for x, _, conf in mapped.values() if conf >= min_confidence]
+    ys = [y for _, y, conf in mapped.values() if conf >= min_confidence]
+    if not xs or not ys:
+        return None
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    return min_x, min_y, max(1, max_x - min_x), max(1, max_y - min_y)
+
+
+def _com_near_bbox(com: tuple[int, int] | None, bbox: tuple[int, int, int, int] | None) -> bool:
+    if com is None or bbox is None:
+        return True
+    x, y, w, h = bbox
+    margin = max(12.0, max(w, h) * 0.1)
+    return (x - margin) <= com[0] <= (x + w + margin) and (y - margin) <= com[1] <= (y + h + margin)
+
+
 def _draw_balance_overlay(
     frame,
     mapped: dict[str, tuple[int, int, float]],
@@ -1127,6 +1221,22 @@ def _draw_balance_overlay(
         )
 
 
+def _draw_com_dot(frame, com: tuple[int, int] | None) -> None:
+    if cv2 is None or com is None:
+        return
+    cv2.circle(frame, com, 6, (0, 255, 0), -1)
+    cv2.putText(
+        frame,
+        "COM",
+        (com[0] + 6, com[1] - 6),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 255, 0),
+        1,
+        cv2.LINE_AA,
+    )
+
+
 def _count_joints_above(normalized: list[dict[str, float | str]], min_confidence: float) -> int:
     return sum(1 for kp in normalized if float(kp.get("c", 0.0)) >= min_confidence)
 
@@ -1134,6 +1244,14 @@ def _count_joints_above(normalized: list[dict[str, float | str]], min_confidence
 def _average_confidence(normalized: list[dict[str, float | str]]) -> float:
     confidences = [float(kp.get("c", 0.0)) for kp in normalized]
     return sum(confidences) / len(confidences) if confidences else 0.0
+
+
+def _mapped_bounds(mapped: dict[str, tuple[int, int, float]]) -> tuple[int, int, int, int] | None:
+    if not mapped:
+        return None
+    xs = [coord[0] for coord in mapped.values()]
+    ys = [coord[1] for coord in mapped.values()]
+    return min(xs), max(xs), min(ys), max(ys)
 
 
 def _score_primary_candidate(
@@ -1182,6 +1300,198 @@ def _draw_no_pose(frame) -> None:
     )
 
 
+def _draw_alert_label(frame, message: str, origin: tuple[int, int] = (10, 80)) -> None:
+    if cv2 is None:
+        return
+    cv2.putText(
+        frame,
+        message,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 0, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def _select_debug_pack_frames(
+    candidates: list[dict[str, object]],
+    target_count: int = 12,
+) -> list[dict[str, object]]:
+    if not candidates:
+        return []
+    sorted_candidates = sorted(candidates, key=lambda item: float(item.get("avg_conf", 0.0)))
+    if len(sorted_candidates) <= target_count:
+        return sorted_candidates
+    third = max(1, len(sorted_candidates) // 3)
+    low = sorted_candidates[:third]
+    mid = sorted_candidates[third : 2 * third]
+    high = sorted_candidates[2 * third :]
+    pick = []
+    for bucket in (high, mid, low):
+        if not bucket:
+            continue
+        step = max(1, len(bucket) // 4)
+        selected = bucket[::step][:4]
+        pick.extend(selected)
+    return pick[:target_count]
+
+
+def _write_debug_pack(
+    video_path: Path,
+    output_root: Path,
+    fps: float,
+    width: int,
+    height: int,
+    tracks: dict[str, dict[str, object]],
+    track_transforms: dict[str, dict[str, float | str]],
+    selected_frames: list[dict[str, object]],
+    min_keypoint_confidence: float,
+) -> None:
+    if cv2 is None or not selected_frames:
+        return
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    pack_dir = output_root / f"debug_pack_{timestamp}"
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    report: dict[str, object] = {
+        "frames": [],
+        "video": {
+            "path": str(video_path),
+            "fps": fps,
+            "width": width,
+            "height": height,
+        },
+    }
+    cap = cv2.VideoCapture(str(video_path))
+    frame_lookup = {int(item["frame_index"]): item for item in selected_frames}
+    frame_index = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_index not in frame_lookup:
+            frame_index += 1
+            continue
+        item = frame_lookup[frame_index]
+        track_id = str(item.get("track_id", ""))
+        track = tracks.get(track_id)
+        transform = track_transforms.get(track_id)
+        if track is None or transform is None:
+            frame_index += 1
+            continue
+        frame_entry = next(
+            (entry for entry in track.get("frames", []) if int(entry.get("frame_index", -1)) == frame_index),
+            None,
+        )
+        if frame_entry is None:
+            frame_index += 1
+            continue
+        keypoints = frame_entry.get("keypoints_2d", [])
+        bbox = frame_entry.get("bbox_xywh")
+        try:
+            mapped, mapped_ordered, keypoint_info, layout_name, skeleton, normalized = _convert_keypoints(
+                keypoints, transform
+            )
+        except ValueError:
+            frame_index += 1
+            continue
+        converted_bbox = _convert_bbox(bbox, transform) if bbox is not None else None
+        derived_bbox = _bbox_from_points(mapped, min_keypoint_confidence)
+        bbox_to_draw = converted_bbox or derived_bbox
+        com = _center_of_mass(mapped, min_keypoint_confidence)
+        full_frame = frame.copy()
+        dots_frame = frame.copy()
+        skeleton_frame = frame.copy()
+        if bbox_to_draw:
+            _draw_bbox(dots_frame, bbox_to_draw, (0, 255, 255))
+            _draw_bbox(skeleton_frame, bbox_to_draw, (0, 255, 255))
+        _draw_com_dot(dots_frame, com)
+        _draw_com_dot(skeleton_frame, com)
+        _draw_pose_overlay(
+            dots_frame,
+            {name: (x, y, conf) for name, (x, y, conf) in mapped.items()},
+            (0, 200, 255),
+            [],
+            min_keypoint_confidence,
+            draw_lines=False,
+        )
+        _draw_joint_index_labels(dots_frame, mapped_ordered, (255, 255, 255), min_keypoint_confidence)
+        if layout_name is not None:
+            _draw_pose_overlay(
+                skeleton_frame,
+                {name: (x, y, conf) for name, (x, y, conf) in mapped.items()},
+                (0, 200, 255),
+                skeleton,
+                min_keypoint_confidence,
+                draw_lines=True,
+            )
+        else:
+            _draw_alert_label(skeleton_frame, "UNKNOWN_LAYOUT")
+        crop = None
+        if bbox_to_draw:
+            x, y, w, h = bbox_to_draw
+            pad = int(round(max(w, h) * 0.2))
+            x1 = max(0, x - pad)
+            y1 = max(0, y - pad)
+            x2 = min(width, x + w + pad)
+            y2 = min(height, y + h + pad)
+            crop = (x1, y1, x2, y2)
+        if crop:
+            x1, y1, x2, y2 = crop
+            crop_dots = dots_frame[y1:y2, x1:x2]
+            crop_skeleton = skeleton_frame[y1:y2, x1:x2]
+        else:
+            crop_dots = dots_frame
+            crop_skeleton = skeleton_frame
+        base_name = f"frame_{frame_index:05d}_track_{track_id}"
+        cv2.imwrite(str(pack_dir / f"{base_name}_full_frame_original.png"), full_frame)
+        cv2.imwrite(str(pack_dir / f"{base_name}_full_frame_dots_labeled.png"), dots_frame)
+        if layout_name is not None:
+            cv2.imwrite(str(pack_dir / f"{base_name}_full_frame_skeleton.png"), skeleton_frame)
+        cv2.imwrite(str(pack_dir / f"{base_name}_crop_subject_dots_labeled.png"), crop_dots)
+        if layout_name is not None:
+            cv2.imwrite(str(pack_dir / f"{base_name}_crop_subject_skeleton.png"), crop_skeleton)
+        bounds = _mapped_bounds(mapped)
+        report["frames"].append(
+            {
+                "frame_index": frame_index,
+                "track_id": track_id,
+                "coord_space": transform.get("coord_space"),
+                "K": keypoint_info.get("count"),
+                "stride": keypoint_info.get("stride"),
+                "representation": keypoint_info.get("representation"),
+                "layout": layout_name or "UNKNOWN_LAYOUT",
+                "raw_samples": keypoint_info.get("raw_samples"),
+                "mapped_bounds": bounds,
+                "avg_confidence": _average_confidence(normalized),
+                "files": {
+                    "full_frame_original": f"{base_name}_full_frame_original.png",
+                    "full_frame_dots_labeled": f"{base_name}_full_frame_dots_labeled.png",
+                    "full_frame_skeleton": f"{base_name}_full_frame_skeleton.png" if layout_name else None,
+                    "crop_subject_dots_labeled": f"{base_name}_crop_subject_dots_labeled.png",
+                    "crop_subject_skeleton": f"{base_name}_crop_subject_skeleton.png" if layout_name else None,
+                },
+            }
+        )
+        frame_index += 1
+    cap.release()
+    (pack_dir / "debug_pack_report.json").write_text(json_dumps(report), encoding="utf-8")
+    readme_lines = [
+        "FightingOverlay Debug Pack",
+        "",
+        "Each frame includes:",
+        "- full_frame_original.png",
+        "- full_frame_dots_labeled.png (dots + indices + COM + bbox)",
+        "- full_frame_skeleton.png (if layout known)",
+        "- crop_subject_dots_labeled.png",
+        "- crop_subject_skeleton.png",
+        "",
+        "See debug_pack_report.json for keypoint metadata.",
+    ]
+    (pack_dir / "README.txt").write_text("\n".join(readme_lines), encoding="utf-8")
+
+
 def export_overlay_video(
     video_path: Path,
     output_path: Path,
@@ -1199,6 +1509,7 @@ def export_overlay_video(
     track_sort: str = "confidence",
     live_preview: bool = True,
     draw_bboxes: bool = False,
+    generate_debug_pack: bool | None = None,
     cancel_event: object | None = None,
     status_callback: StatusCallback | None = None,
     info_callback: InfoCallback | None = None,
@@ -1218,6 +1529,7 @@ def export_overlay_video(
     track_transforms: dict[str, dict[str, float | str]] = {}
     warned_frame_sync: set[str] = set()
     valid_tracks: list[dict[str, object]] = []
+    track_lookup: dict[str, dict[str, object]] = {}
     for track in tracks:
         track_id = str(track.get("track_id", "unknown"))
         try:
@@ -1226,6 +1538,7 @@ def export_overlay_video(
             continue
         track_transforms[track_id] = transform
         valid_tracks.append(track)
+        track_lookup[track_id] = track
         logging.info(
             (
                 "Overlay mapping track=%s orig=(%s,%s) infer=(%s,%s) resized=(%s,%s) "
@@ -1271,19 +1584,25 @@ def export_overlay_video(
     smoothed_cache: dict[str, dict[str, tuple[float, float, float]]] = {}
     logged_keypoints = False
     logged_mapping_warning = False
+    forensics_logged: dict[str, int] = {}
+    debug_pack_candidates: list[dict[str, object]] = []
+    if generate_debug_pack is None:
+        generate_debug_pack = debug_overlay
     overlay_mode_normalized = overlay_mode.strip().lower()
     mode_debug = "debug" in overlay_mode_normalized
     mode_balance = "balance" in overlay_mode_normalized
     mode_joints = "joints" in overlay_mode_normalized or "dots" in overlay_mode_normalized
     mode_skeleton = "skeleton" in overlay_mode_normalized or "lines" in overlay_mode_normalized
-    draw_lines = mode_skeleton or mode_debug
+    draw_lines = mode_skeleton or (mode_debug and not mode_joints)
     draw_joints = mode_skeleton or mode_joints or mode_debug
     draw_balance = mode_balance
     show_labels = mode_debug
+    show_joint_indices = mode_debug or mode_joints
     show_debug_regions = mode_debug
     draw_bboxes = draw_bboxes or mode_debug
     if mode_debug:
         logging.info("Debug overlay enabled: capture a screenshot to validate mapping primitives.")
+        draw_all_tracks = True
 
     max_tracks = max(1, min(int(max_tracks), 50))
     track_stats: dict[str, dict[str, float]] = {}
@@ -1432,9 +1751,12 @@ def export_overlay_video(
                 converted_bbox = _convert_bbox(bbox, transform) if bbox is not None else None
                 keypoints = entry.get("keypoints_2d", [])
                 try:
-                    mapped, keypoint_info, layout_name, skeleton, normalized = _convert_keypoints(keypoints, transform)
+                    mapped, mapped_ordered, keypoint_info, layout_name, skeleton, normalized = _convert_keypoints(
+                        keypoints, transform
+                    )
                 except ValueError as exc:
-                    _record_problem(info_callback, "KEYPOINT_SHAPE_MISMATCH", f"Track {track_id}: {exc}")
+                    _record_problem(info_callback, "KEYPOINT_PARSE_ERROR", f"Track {track_id}: {exc}")
+                    _draw_alert_label(annotated, "KEYPOINT_PARSE_ERROR")
                     continue
                 if layout_name is None and not logged_keypoints:
                     message = (
@@ -1442,7 +1764,7 @@ def export_overlay_video(
                         f"K={keypoint_info.get('count')} shape={keypoint_info.get('shape')} "
                         f"stride={keypoint_info.get('stride')}; drawing dots only."
                     )
-                    _record_problem(info_callback, "KEYPOINT_LAYOUT_UNKNOWN", message)
+                    _record_problem(info_callback, "UNKNOWN_LAYOUT", message)
                 if mapped:
                     total_kps = len(mapped)
                     out_of_bounds = sum(
@@ -1491,18 +1813,34 @@ def export_overlay_video(
                 if converted_bbox:
                     _, _, w, h = converted_bbox
                     bbox_area = max(0.0, float(w) * float(h))
+                derived_bbox = _bbox_from_points(mapped, min_keypoint_confidence)
+                bbox_for_com = converted_bbox
+                com = _center_of_mass(mapped, min_keypoint_confidence)
+                com_matches = True
+                if str(transform.get("coord_space", "")) == "pixels_in_original":
+                    com_matches = _com_near_bbox(com, bbox_for_com)
+                    if not com_matches and bbox_for_com:
+                        message = (
+                            f"Keypoints COM outside bbox track={track_id} frame={frame_index} "
+                            f"com={com} bbox={bbox_for_com}"
+                        )
+                        _record_problem(info_callback, "KEYPOINTS_NOT_MATCHING_TRACK", message)
                 frame_candidates.append(
                     {
                         "track_id": track_id,
                         "mapped": mapped,
+                        "mapped_ordered": mapped_ordered,
                         "layout_name": layout_name,
                         "skeleton": skeleton,
                         "normalized": normalized,
-                        "bbox": converted_bbox,
+                        "bbox": converted_bbox or derived_bbox,
+                        "bbox_raw": converted_bbox,
                         "joints_above": joints_above,
                         "avg_conf": avg_conf,
                         "bbox_area": bbox_area,
-                        "com": _center_of_mass(mapped, min_keypoint_confidence),
+                        "com": com,
+                        "com_matches": com_matches,
+                        "keypoint_info": keypoint_info,
                     }
                 )
 
@@ -1576,14 +1914,32 @@ def export_overlay_video(
             else:
                 allowed_track_ids = set()
 
+            if generate_debug_pack and current_primary_id:
+                primary_candidate = next(
+                    (candidate for candidate in frame_candidates if candidate["track_id"] == current_primary_id),
+                    None,
+                )
+                if primary_candidate:
+                    debug_pack_candidates.append(
+                        {
+                            "frame_index": frame_index,
+                            "track_id": current_primary_id,
+                            "avg_conf": primary_candidate.get("avg_conf", 0.0),
+                        }
+                    )
+
             for idx, candidate in enumerate(frame_candidates):
                 track_id = str(candidate.get("track_id", "track"))
                 if allowed_track_ids and track_id not in allowed_track_ids:
                     continue
                 color = colors[idx % len(colors)]
                 mapped = candidate["mapped"]
+                mapped_ordered = candidate["mapped_ordered"]
                 layout_name = candidate["layout_name"]
                 skeleton = candidate["skeleton"]
+                keypoint_info = candidate.get("keypoint_info", {})
+                com = candidate.get("com")
+                com_matches = bool(candidate.get("com_matches", True))
                 smoothed_track = smoothed_cache.setdefault(track_id, {})
                 smoothed_mapped: dict[str, tuple[int, int, float]] = {}
                 if smoothing_enabled:
@@ -1603,14 +1959,49 @@ def export_overlay_video(
                             continue
                         smoothed_mapped[name] = (int(round(x)), int(round(y)), conf)
 
+                if track_id in allowed_track_ids:
+                    logged_count = forensics_logged.get(track_id, 0)
+                    if logged_count < 3:
+                        bounds = _mapped_bounds(mapped)
+                        avg_conf = _average_confidence(candidate.get("normalized", []))
+                        forensics = {
+                            "frame_idx": frame_index,
+                            "track_id": track_id,
+                            "K": keypoint_info.get("count"),
+                            "representation": keypoint_info.get("representation"),
+                            "stride": keypoint_info.get("stride"),
+                            "raw_samples": keypoint_info.get("raw_samples"),
+                            "mapped_bounds": bounds,
+                            "avg_confidence": avg_conf,
+                        }
+                        logging.info("KEYPOINT_FORENSICS %s", forensics)
+                        if mode_debug:
+                            lines = [
+                                f"frame={frame_index} track={track_id} K={forensics['K']}",
+                                f"repr={forensics['representation']} stride={forensics['stride']}",
+                                f"raw={forensics['raw_samples']}",
+                                f"mapped_bounds={forensics['mapped_bounds']}",
+                                f"avg_conf={forensics['avg_confidence']:.3f}",
+                            ]
+                            _draw_forensics_stamp(annotated, lines)
+                        forensics_logged[track_id] = logged_count + 1
+
                 if draw_bboxes:
                     bbox = candidate.get("bbox")
                     if bbox:
                         _draw_bbox(annotated, bbox, color)
+                if mode_debug:
+                    _draw_com_dot(annotated, com)
                 if show_labels:
                     _draw_keypoint_labels(annotated, mapped, color)
+                if show_joint_indices or layout_name is None:
+                    _draw_joint_index_labels(annotated, mapped_ordered, color, min_keypoint_confidence)
                 if draw_balance:
                     _draw_balance_overlay(annotated, smoothed_mapped, min_keypoint_confidence, color)
+                if layout_name is None:
+                    _draw_alert_label(annotated, "UNKNOWN_LAYOUT")
+                if not com_matches:
+                    _draw_alert_label(annotated, "KEYPOINTS_NOT_MATCHING_TRACK", origin=(10, 100))
                 if draw_joints:
                     _draw_pose_overlay(
                         annotated,
@@ -1618,7 +2009,7 @@ def export_overlay_video(
                         color,
                         skeleton,
                         min_keypoint_confidence,
-                        draw_lines=layout_name is not None and draw_lines,
+                        draw_lines=layout_name is not None and draw_lines and com_matches,
                     )
                 label_x, label_y = _select_label_position(smoothed_mapped)
                 cv2.putText(
@@ -1678,6 +2069,19 @@ def export_overlay_video(
             )
     cap.release()
     writer.release()
+    if generate_debug_pack and debug_pack_candidates:
+        selected = _select_debug_pack_frames(debug_pack_candidates)
+        _write_debug_pack(
+            video_path,
+            get_outputs_root(),
+            fps,
+            width,
+            height,
+            track_lookup,
+            track_transforms,
+            selected,
+            min_keypoint_confidence,
+        )
     model_backend = "unknown"
     if tracks:
         source = tracks[0].get("source", {})
@@ -1775,6 +2179,7 @@ def run_pipeline(
                 track_sort=options.track_sort,
                 live_preview=options.live_preview and mode == preview_mode,
                 draw_bboxes=draw_bboxes,
+                generate_debug_pack=options.debug_overlay and mode == "debug",
                 cancel_event=cancel_event,
                 status_callback=status_callback,
                 info_callback=info_callback,
