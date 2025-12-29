@@ -30,8 +30,6 @@ from tkinter import (
 )
 import tkinter.font as tkfont
 
-import cv2  # type: ignore
-
 from core.paths import (
     get_app_root,
     get_bootstrapper_path,
@@ -56,6 +54,17 @@ OVERLAY_OPTIONS = {
     "Combat overlay": {"slug": "combat", "file": "overlay_combat.mp4"},
     "Debug overlay": {"slug": "debug", "file": "overlay_debug.mp4"},
 }
+
+_CV2 = None
+
+
+def get_cv2():
+    global _CV2
+    if _CV2 is None:
+        import cv2  # type: ignore
+
+        _CV2 = cv2
+    return _CV2
 
 
 class TkTextHandler(logging.Handler):
@@ -109,7 +118,7 @@ def setup_logging() -> None:
 
 def check_opencv(show_dialog: bool) -> bool:
     try:
-        import cv2  # type: ignore
+        cv2 = get_cv2()
     except ImportError:
         message = (
             "OpenCV (cv2) is missing from this build. Please update or reinstall "
@@ -432,6 +441,7 @@ def main() -> None:
     setup_logging()
     if not check_opencv(show_dialog=not args.test_mode):
         return
+    cv2 = get_cv2()
 
     defaults = {
         "debug_overlay": False,
