@@ -29,6 +29,9 @@ class ProcessingOptions:
     debug_overlay: bool = True
     draw_all_tracks: bool = False
     smoothing_alpha: float = 0.7
+    min_keypoint_confidence: float = 0.2
+    tracking_backend: str = "Motion (fast)"
+    manual_track_ids: list[str] | None = None
 
 
 class ProcessingCancelled(RuntimeError):
@@ -158,6 +161,117 @@ def generate_synthetic_tracks(
     return tracks
 
 
+def _build_track_source(width: int, height: int, backend: str) -> dict[str, object]:
+    return {
+        "backend": backend,
+        "keypoint_format": "name-2d",
+        "coord_space": "inference_pixel",
+        "input_width": width,
+        "input_height": height,
+        "pad_x": 0.0,
+        "pad_y": 0.0,
+    }
+
+
+def run_motion_tracking(
+    video_path: Path,
+    fps: float,
+    width: int,
+    height: int,
+    cancel_event: object | None = None,
+    info_callback: InfoCallback | None = None,
+) -> list[dict[str, object]]:
+    if cv2 is None:
+        raise RuntimeError("OpenCV is required for motion tracking.")
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError("Unable to open video for motion tracking.")
+    subtractor = cv2.createBackgroundSubtractorMOG2(history=120, varThreshold=24, detectShadows=True)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    next_track_id = 1
+    tracks: dict[str, dict[str, object]] = {}
+    active: dict[str, dict[str, float]] = {}
+    max_distance = max(60.0, min(width, height) * 0.08)
+    frame_index = 0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    while True:
+        if cancel_event is not None and getattr(cancel_event, "is_set")():
+            cap.release()
+            raise ProcessingCancelled("Processing cancelled")
+        ret, frame = cap.read()
+        if not ret:
+            break
+        mask = subtractor.apply(frame)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel, iterations=2)
+        _, mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
+        contour_result = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = contour_result[0] if len(contour_result) == 2 else contour_result[1]
+        detections: list[tuple[int, int, int, int, float]] = []
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < (width * height) * 0.003:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            confidence = min(1.0, area / max(1.0, (width * height) * 0.05))
+            detections.append((x, y, w, h, confidence))
+        matched: set[str] = set()
+        for x, y, w, h, confidence in detections:
+            cx = x + w / 2
+            cy = y + h / 2
+            best_id = None
+            best_dist = max_distance
+            for track_id, state in active.items():
+                dx = cx - state["cx"]
+                dy = cy - state["cy"]
+                dist = math.hypot(dx, dy)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_id = track_id
+            if best_id is None:
+                track_id = f"t{next_track_id}"
+                next_track_id += 1
+                tracks[track_id] = {
+                    "track_id": track_id,
+                    "person_index": int(track_id[1:]) - 1,
+                    "is_foreground": False,
+                    "source": _build_track_source(width, height, "motion"),
+                    "frames": [],
+                }
+            else:
+                track_id = best_id
+            active[track_id] = {"cx": cx, "cy": cy, "last_frame": float(frame_index)}
+            matched.add(track_id)
+            bbox = [float(x), float(y), float(w), float(h)]
+            tracks[track_id]["frames"].append(
+                {
+                    "frame_index": frame_index,
+                    "timestamp_ms": int(frame_index / fps * 1000),
+                    "bbox_xywh": bbox,
+                    "keypoints_2d": _make_keypoints(bbox),
+                    "confidence": confidence,
+                }
+            )
+        inactive = [track_id for track_id in active if track_id not in matched]
+        for track_id in inactive:
+            if frame_index - int(active[track_id]["last_frame"]) > int(fps):
+                active.pop(track_id, None)
+        if frame_index % 5 == 0 or frame_index == total_frames - 1:
+            _update_info(
+                info_callback,
+                {
+                    "stage": "Running inference",
+                    "frame_index": frame_index + 1,
+                    "total_frames": total_frames or frame_index + 1,
+                    "people": len(detections),
+                    "effective_fps": fps,
+                },
+            )
+        frame_index += 1
+    cap.release()
+    return list(tracks.values())
+
+
 def _score_track(frames: list[dict[str, object]]) -> float:
     if not frames:
         return 0.0
@@ -178,12 +292,40 @@ def _score_track(frames: list[dict[str, object]]) -> float:
     return avg_area * (1 + motion_energy / 100)
 
 
-def select_foreground_tracks(tracks: list[dict[str, object]], foreground_count: int = 2) -> None:
-    scored = []
+def select_foreground_tracks(
+    tracks: list[dict[str, object]],
+    foreground_count: int = 2,
+    mode: str = "Auto (closest/most active)",
+    manual_track_ids: list[str] | None = None,
+) -> None:
     for track in tracks:
-        frames = track.get("frames", [])
-        score = _score_track(frames)
-        scored.append((score, track))
+        track["is_foreground"] = False
+    if mode == "Manual pick":
+        if manual_track_ids:
+            manual_set = {track_id.strip() for track_id in manual_track_ids if track_id.strip()}
+            for track in tracks:
+                if str(track.get("track_id", "")) in manual_set:
+                    track["is_foreground"] = True
+        return
+    if mode == "Foreground=Top2 largest":
+        scored = []
+        for track in tracks:
+            frames = track.get("frames", [])
+            areas = []
+            for frame in frames:
+                bbox = frame.get("bbox_xywh")
+                if not bbox or len(bbox) != 4:
+                    continue
+                _, _, w, h = bbox
+                areas.append(float(w) * float(h))
+            avg_area = sum(areas) / len(areas) if areas else 0.0
+            scored.append((avg_area, track))
+    else:
+        scored = []
+        for track in tracks:
+            frames = track.get("frames", [])
+            score = _score_track(frames)
+            scored.append((score, track))
     scored.sort(key=lambda item: item[0], reverse=True)
     for index, (_, track) in enumerate(scored):
         track["is_foreground"] = index < foreground_count
@@ -223,8 +365,15 @@ def run_inference(
 
     _update_status(status_callback, "Running inference...", 15)
     _update_info(info_callback, {"stage": "Running inference"})
-    tracks = generate_synthetic_tracks(frame_count, fps, width, height, cancel_event, info_callback)
-    select_foreground_tracks(tracks)
+    if options.tracking_backend == "Synthetic (demo)" or video_path is None:
+        tracks = generate_synthetic_tracks(frame_count, fps, width, height, cancel_event, info_callback)
+    else:
+        tracks = run_motion_tracking(video_path, fps, width, height, cancel_event, info_callback)
+    select_foreground_tracks(
+        tracks,
+        mode=options.foreground_mode,
+        manual_track_ids=options.manual_track_ids,
+    )
 
     if not options.save_background_tracks:
         tracks = [track for track in tracks if track.get("is_foreground")]
@@ -477,17 +626,22 @@ def _draw_bbox(frame, bbox_xywh: tuple[int, int, int, int], color: tuple[int, in
     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
 
-def _draw_pose_overlay(frame, mapped: dict[str, tuple[int, int, float]], color: tuple[int, int, int]) -> None:
+def _draw_pose_overlay(
+    frame,
+    mapped: dict[str, tuple[int, int, float]],
+    color: tuple[int, int, int],
+    min_confidence: float = 0.1,
+) -> None:
     if cv2 is None:
         return
     for a, b in _SKELETON_CONNECTIONS:
         if a in mapped and b in mapped:
             ax, ay, ac = mapped[a]
             bx, by, bc = mapped[b]
-            if ac > 0.1 and bc > 0.1:
+            if ac > min_confidence and bc > min_confidence:
                 cv2.line(frame, (ax, ay), (bx, by), color, 2)
     for _, (x, y, conf) in mapped.items():
-        if conf > 0.1:
+        if conf > min_confidence:
             cv2.circle(frame, (x, y), 3, color, -1)
 
 
@@ -533,6 +687,7 @@ def export_overlay_video(
     debug_overlay: bool = True,
     draw_all_tracks: bool = False,
     smoothing_alpha: float = 0.7,
+    min_keypoint_confidence: float = 0.1,
     cancel_event: object | None = None,
     status_callback: StatusCallback | None = None,
     info_callback: InfoCallback | None = None,
@@ -632,6 +787,8 @@ def export_overlay_video(
                 smoothed_track = smoothed_cache.setdefault(track_id, {})
                 smoothed_mapped: dict[str, tuple[int, int, float]] = {}
                 for name, (x, y, conf) in mapped.items():
+                    if conf < min_keypoint_confidence:
+                        continue
                     if name in smoothed_track:
                         prev_x, prev_y, prev_c = smoothed_track[name]
                         x = smoothing_alpha * x + (1 - smoothing_alpha) * prev_x
@@ -639,7 +796,7 @@ def export_overlay_video(
                         conf = smoothing_alpha * conf + (1 - smoothing_alpha) * prev_c
                     smoothed_track[name] = (x, y, conf)
                     smoothed_mapped[name] = (int(round(x)), int(round(y)), conf)
-                _draw_pose_overlay(annotated, smoothed_mapped, color)
+                _draw_pose_overlay(annotated, smoothed_mapped, color, min_keypoint_confidence)
                 label_x, label_y = _select_label_position(smoothed_mapped)
                 cv2.putText(
                     annotated,
@@ -751,6 +908,7 @@ def run_pipeline(
             debug_overlay=options.debug_overlay,
             draw_all_tracks=options.draw_all_tracks,
             smoothing_alpha=options.smoothing_alpha,
+            min_keypoint_confidence=options.min_keypoint_confidence,
             cancel_event=cancel_event,
             status_callback=status_callback,
             info_callback=info_callback,
