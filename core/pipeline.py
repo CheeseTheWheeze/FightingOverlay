@@ -26,7 +26,7 @@ class ProcessingOptions:
     save_thumbnails: bool = False
     save_background_tracks: bool = True
     foreground_mode: str = "Auto (closest/most active)"
-    debug_overlay: bool = True
+    debug_overlay: bool = False
     draw_all_tracks: bool = False
     smoothing_alpha: float = 0.7
     min_keypoint_confidence: float = 0.2
@@ -149,11 +149,20 @@ def generate_synthetic_tracks(
                 "source": {
                     "backend": "synthetic",
                     "keypoint_format": "name-2d",
-                    "coord_space": "inference_pixel",
-                    "input_width": width,
-                    "input_height": height,
-                    "pad_x": 0.0,
-                    "pad_y": 0.0,
+                    "coord_space": "pixels_in_original",
+                    "transform_kind": "NONE",
+                    "infer_width": width,
+                    "infer_height": height,
+                    "resized_width": width,
+                    "resized_height": height,
+                    "pad_left": 0.0,
+                    "pad_right": 0.0,
+                    "pad_top": 0.0,
+                    "pad_bottom": 0.0,
+                    "crop_x": 0.0,
+                    "crop_y": 0.0,
+                    "crop_w": width,
+                    "crop_h": height,
                 },
                 "frames": frames,
             }
@@ -165,11 +174,20 @@ def _build_track_source(width: int, height: int, backend: str) -> dict[str, obje
     return {
         "backend": backend,
         "keypoint_format": "name-2d",
-        "coord_space": "inference_pixel",
-        "input_width": width,
-        "input_height": height,
-        "pad_x": 0.0,
-        "pad_y": 0.0,
+        "coord_space": "pixels_in_original",
+        "transform_kind": "NONE",
+        "infer_width": width,
+        "infer_height": height,
+        "resized_width": width,
+        "resized_height": height,
+        "pad_left": 0.0,
+        "pad_right": 0.0,
+        "pad_top": 0.0,
+        "pad_bottom": 0.0,
+        "crop_x": 0.0,
+        "crop_y": 0.0,
+        "crop_w": width,
+        "crop_h": height,
     }
 
 
@@ -362,6 +380,17 @@ def run_inference(
     fps = float(video_meta["fps"])
     width = int(video_meta["width"])
     height = int(video_meta["height"])
+    duration_s = frame_count / max(1.0, fps)
+    _update_info(
+        info_callback,
+        {
+            "video_width": width,
+            "video_height": height,
+            "video_fps": fps,
+            "video_frames": frame_count,
+            "video_duration_s": duration_s,
+        },
+    )
 
     _update_status(status_callback, "Running inference...", 15)
     _update_info(info_callback, {"stage": "Running inference"})
@@ -374,6 +403,29 @@ def run_inference(
         mode=options.foreground_mode,
         manual_track_ids=options.manual_track_ids,
     )
+
+    if tracks:
+        source = tracks[0].get("source", {})
+        if isinstance(source, dict):
+            _update_info(
+                info_callback,
+                {
+                    "coord_space": source.get("coord_space"),
+                    "transform_kind": source.get("transform_kind"),
+                    "infer_width": source.get("infer_width"),
+                    "infer_height": source.get("infer_height"),
+                    "resized_width": source.get("resized_width"),
+                    "resized_height": source.get("resized_height"),
+                    "pad_left": source.get("pad_left"),
+                    "pad_right": source.get("pad_right"),
+                    "pad_top": source.get("pad_top"),
+                    "pad_bottom": source.get("pad_bottom"),
+                    "crop_x": source.get("crop_x"),
+                    "crop_y": source.get("crop_y"),
+                    "crop_w": source.get("crop_w"),
+                    "crop_h": source.get("crop_h"),
+                },
+            )
 
     if not options.save_background_tracks:
         tracks = [track for track in tracks if track.get("is_foreground")]
@@ -426,8 +478,8 @@ def _normalize_keypoints(keypoints: list[object]) -> list[dict[str, float | str]
     """Normalize keypoints into name/x/y/c dicts.
 
     Coordinate convention:
-      - keypoints are expected in *inference frame* pixel coords by default.
-      - If coord_space == "normalized", values are normalized [0..1] relative to inference size.
+      - keypoints are expected in the coord_space declared in track metadata.
+      - normalized coordinates are normalized [0..1] relative to the declared space.
       - All coordinates are converted to ORIGINAL frame pixel coords before drawing.
     """
     if not isinstance(keypoints, list):
@@ -487,39 +539,124 @@ def _build_transform(
     source = track.get("source", {})
     if not isinstance(source, dict):
         source = {}
-    coord_space = str(source.get("coord_space", "inference_pixel"))
-    infer_w = int(source.get("input_width", frame_width) or frame_width)
-    infer_h = int(source.get("input_height", frame_height) or frame_height)
-    pad_x = float(source.get("pad_x", 0.0))
-    pad_y = float(source.get("pad_y", 0.0))
-    scale_x = frame_width / max(1.0, float(infer_w))
-    scale_y = frame_height / max(1.0, float(infer_h))
+    coord_space = str(source.get("coord_space", "pixels_in_original"))
+    transform_kind = str(source.get("transform_kind", "NONE")).upper()
+    infer_w = int(source.get("infer_width", source.get("input_width", frame_width)) or frame_width)
+    infer_h = int(source.get("infer_height", source.get("input_height", frame_height)) or frame_height)
+    resized_w = source.get("resized_width")
+    resized_h = source.get("resized_height")
+    if resized_w is None or resized_h is None:
+        logging.warning(
+            "Missing resized dimensions in track source; falling back to infer size. "
+            "Please store resized_width/resized_height at preprocess time."
+        )
+    resized_w = int(resized_w or infer_w)
+    resized_h = int(resized_h or infer_h)
+    pad_left = float(source.get("pad_left", source.get("pad_x", 0.0)))
+    pad_right = float(source.get("pad_right", source.get("pad_x", 0.0)))
+    pad_top = float(source.get("pad_top", source.get("pad_y", 0.0)))
+    pad_bottom = float(source.get("pad_bottom", source.get("pad_y", 0.0)))
+    crop_x = float(source.get("crop_x", 0.0))
+    crop_y = float(source.get("crop_y", 0.0))
+    crop_w = float(source.get("crop_w", frame_width))
+    crop_h = float(source.get("crop_h", frame_height))
+    if transform_kind == "LETTERBOX":
+        inferred_w = pad_left + float(resized_w) + pad_right
+        inferred_h = pad_top + float(resized_h) + pad_bottom
+        if abs(inferred_w - infer_w) > 1.0 or abs(inferred_h - infer_h) > 1.0:
+            logging.warning(
+                "LETTERBOX pad mismatch: infer=(%s,%s) pad+resized=(%.1f,%.1f)",
+                infer_w,
+                infer_h,
+                inferred_w,
+                inferred_h,
+            )
+    if transform_kind == "DIRECT_RESIZE" and any(value > 0.0 for value in (pad_left, pad_right, pad_top, pad_bottom)):
+        logging.warning("DIRECT_RESIZE received non-zero padding values.")
+    if transform_kind in {"CROP", "CENTER_CROP"} and (crop_w <= 0 or crop_h <= 0):
+        logging.warning("CROP transform missing crop bounds (crop_w/crop_h).")
     return {
         "coord_space": coord_space,
+        "transform_kind": transform_kind,
+        "orig_w": float(frame_width),
+        "orig_h": float(frame_height),
         "infer_w": float(infer_w),
         "infer_h": float(infer_h),
-        "pad_x": pad_x,
-        "pad_y": pad_y,
-        "scale_x": scale_x,
-        "scale_y": scale_y,
+        "resized_w": float(resized_w),
+        "resized_h": float(resized_h),
+        "pad_left": pad_left,
+        "pad_right": pad_right,
+        "pad_top": pad_top,
+        "pad_bottom": pad_bottom,
+        "crop_x": crop_x,
+        "crop_y": crop_y,
+        "crop_w": crop_w,
+        "crop_h": crop_h,
     }
 
 
 def _convert_xy(x: float, y: float, transform: dict[str, float | str]) -> tuple[float, float]:
+    """Map keypoints into original frame pixels using stored preprocess metadata.
+
+    Worked example (LETTERBOX):
+      - orig=1920x1080, infer=1280x1280, resized=1280x720, pad_top=280, pad_bottom=280
+      - keypoint in infer canvas at (640,640) -> resized (640,360)
+      - scale=1280/1920=0.6667 -> original (960,540)
+    """
     coord_space = str(transform["coord_space"])
+    transform_kind = str(transform["transform_kind"]).upper()
     infer_w = float(transform["infer_w"])
     infer_h = float(transform["infer_h"])
-    pad_x = float(transform["pad_x"])
-    pad_y = float(transform["pad_y"])
-    scale_x = float(transform["scale_x"])
-    scale_y = float(transform["scale_y"])
-    if coord_space == "normalized":
-        x *= infer_w
-        y *= infer_h
-        coord_space = "inference_pixel"
-    if coord_space == "inference_pixel":
-        x = (x - pad_x) * scale_x
-        y = (y - pad_y) * scale_y
+    resized_w = float(transform["resized_w"])
+    resized_h = float(transform["resized_h"])
+    pad_left = float(transform["pad_left"])
+    pad_top = float(transform["pad_top"])
+    crop_x = float(transform["crop_x"])
+    crop_y = float(transform["crop_y"])
+    crop_w = float(transform["crop_w"])
+    crop_h = float(transform["crop_h"])
+
+    if coord_space == "pixels_in_original":
+        return x, y
+
+    if coord_space in {"normalized", "normalized_to_infer_canvas"}:
+        x = x * infer_w
+        y = y * infer_h
+        coord_space = "pixels_in_infer_canvas"
+    elif coord_space == "normalized_to_resized_content":
+        x = x * resized_w
+        y = y * resized_h
+        coord_space = "pixels_in_resized_content"
+
+    if coord_space in {"inference_pixel", "pixels_in_infer_canvas"}:
+        x = x - pad_left
+        y = y - pad_top
+        coord_space = "pixels_in_resized_content"
+
+    if coord_space != "pixels_in_resized_content":
+        logging.warning("Unexpected coord_space=%s; returning raw values.", coord_space)
+        return x, y
+
+    if transform_kind == "DIRECT_RESIZE":
+        scale_x = resized_w / max(1.0, float(transform.get("orig_w", resized_w)))
+        scale_y = resized_h / max(1.0, float(transform.get("orig_h", resized_h)))
+        return x / max(1e-6, scale_x), y / max(1e-6, scale_y)
+    if transform_kind == "LETTERBOX":
+        scale_x = resized_w / max(1.0, float(transform.get("orig_w", resized_w)))
+        scale_y = resized_h / max(1.0, float(transform.get("orig_h", resized_h)))
+        if abs(scale_x - scale_y) > 0.001:
+            logging.warning("LETTERBOX scale mismatch: scale_x=%.6f scale_y=%.6f", scale_x, scale_y)
+        scale = scale_x if scale_x > 0 else 1.0
+        return x / max(1e-6, scale), y / max(1e-6, scale)
+    if transform_kind in {"CROP", "CENTER_CROP"}:
+        scale_x = crop_w / max(1.0, resized_w)
+        scale_y = crop_h / max(1.0, resized_h)
+        x_crop = x * scale_x
+        y_crop = y * scale_y
+        return x_crop + crop_x, y_crop + crop_y
+    if transform_kind == "NONE":
+        return x, y
+    logging.warning("Unknown transform_kind=%s; returning raw values.", transform_kind)
     return x, y
 
 
@@ -607,16 +744,122 @@ def _draw_debug_corners(frame, frame_width: int, frame_height: int) -> None:
     color = (0, 255, 255)
     size = 14
     points = [
-        (0, 0, 1, 1),
-        (frame_width - 1, 0, -1, 1),
-        (0, frame_height - 1, 1, -1),
-        (frame_width - 1, frame_height - 1, -1, -1),
+        (0, 0, 1, 1, "(0,0)"),
+        (frame_width - 1, 0, -1, 1, f"({frame_width - 1},0)"),
+        (0, frame_height - 1, 1, -1, f"(0,{frame_height - 1})"),
+        (frame_width - 1, frame_height - 1, -1, -1, f"({frame_width - 1},{frame_height - 1})"),
     ]
-    for x, y, dx, dy in points:
+    for x, y, dx, dy, label in points:
         end_x = min(frame_width - 1, max(0, x + dx * size))
         end_y = min(frame_height - 1, max(0, y + dy * size))
         cv2.line(frame, (x, y), (end_x, y), color, 2)
         cv2.line(frame, (x, y), (x, end_y), color, 2)
+        text_x = min(frame_width - 1, max(0, x + dx * (size + 4)))
+        text_y = min(frame_height - 1, max(0, y + dy * (size + 4)))
+        cv2.putText(
+            frame,
+            label,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def _convert_xy_from_space(
+    x: float,
+    y: float,
+    coord_space: str,
+    transform: dict[str, float | str],
+) -> tuple[float, float]:
+    local = dict(transform)
+    local["coord_space"] = coord_space
+    return _convert_xy(x, y, local)
+
+
+def _draw_debug_regions(frame, transform: dict[str, float | str], frame_width: int, frame_height: int) -> None:
+    if cv2 is None:
+        return
+    frame_color = (0, 255, 0)
+    content_color = (255, 0, 255)
+    cv2.rectangle(frame, (0, 0), (frame_width - 1, frame_height - 1), frame_color, 2)
+
+    transform_kind = str(transform["transform_kind"]).upper()
+    if transform_kind in {"DIRECT_RESIZE", "NONE"}:
+        cv2.rectangle(frame, (0, 0), (frame_width - 1, frame_height - 1), content_color, 2)
+        return
+    if transform_kind in {"CROP", "CENTER_CROP"}:
+        crop_x = int(round(float(transform["crop_x"])))
+        crop_y = int(round(float(transform["crop_y"])))
+        crop_w = int(round(float(transform["crop_w"])))
+        crop_h = int(round(float(transform["crop_h"])))
+        cv2.rectangle(frame, (crop_x, crop_y), (crop_x + crop_w, crop_y + crop_h), content_color, 2)
+        return
+    if transform_kind == "LETTERBOX":
+        pad_left = float(transform["pad_left"])
+        pad_top = float(transform["pad_top"])
+        resized_w = float(transform["resized_w"])
+        resized_h = float(transform["resized_h"])
+        x1, y1 = _convert_xy_from_space(pad_left, pad_top, "pixels_in_infer_canvas", transform)
+        x2, y2 = _convert_xy_from_space(
+            pad_left + resized_w,
+            pad_top + resized_h,
+            "pixels_in_infer_canvas",
+            transform,
+        )
+        cv2.rectangle(
+            frame,
+            (int(round(x1)), int(round(y1))),
+            (int(round(x2)), int(round(y2))),
+            content_color,
+            2,
+        )
+
+
+def _draw_keypoint_labels(
+    frame,
+    mapped: dict[str, tuple[int, int, float]],
+    color: tuple[int, int, int],
+    max_labels: int = 5,
+) -> None:
+    if cv2 is None or not mapped:
+        return
+    preferred = ["nose", "left_hip", "right_hip", "left_shoulder", "right_shoulder"]
+    drawn = 0
+    for name in preferred:
+        if name in mapped and drawn < max_labels:
+            x, y, _ = mapped[name]
+            cv2.putText(
+                frame,
+                f"{name} ({x},{y})",
+                (x + 6, y - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+            drawn += 1
+    if drawn >= max_labels:
+        return
+    for name, (x, y, _) in mapped.items():
+        if name in preferred:
+            continue
+        cv2.putText(
+            frame,
+            f"{name} ({x},{y})",
+            (x + 6, y - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+        drawn += 1
+        if drawn >= max_labels:
+            break
 
 
 def _draw_bbox(frame, bbox_xywh: tuple[int, int, int, int], color: tuple[int, int, int]) -> None:
@@ -705,21 +948,33 @@ def export_overlay_video(
 
     frame_map: dict[int, list[dict[str, object]]] = {}
     track_transforms: dict[str, dict[str, float | str]] = {}
+    warned_frame_sync: set[str] = set()
     for track in tracks:
         track_id = str(track.get("track_id", "unknown"))
         transform = _build_transform(track, width, height)
         track_transforms[track_id] = transform
         logging.info(
-            "Overlay mapping track=%s orig=(%s,%s) infer=(%s,%s) pad=(%.2f,%.2f) scale=(%.4f,%.4f) coord=%s",
+            (
+                "Overlay mapping track=%s orig=(%s,%s) infer=(%s,%s) resized=(%s,%s) "
+                "pad=(l=%.2f,r=%.2f,t=%.2f,b=%.2f) crop=(%.1f,%.1f,%.1f,%.1f) "
+                "transform=%s coord=%s"
+            ),
             track_id,
             width,
             height,
             int(transform["infer_w"]),
             int(transform["infer_h"]),
-            float(transform["pad_x"]),
-            float(transform["pad_y"]),
-            float(transform["scale_x"]),
-            float(transform["scale_y"]),
+            int(transform["resized_w"]),
+            int(transform["resized_h"]),
+            float(transform["pad_left"]),
+            float(transform["pad_right"]),
+            float(transform["pad_top"]),
+            float(transform["pad_bottom"]),
+            float(transform["crop_x"]),
+            float(transform["crop_y"]),
+            float(transform["crop_w"]),
+            float(transform["crop_h"]),
+            transform["transform_kind"],
             transform["coord_space"],
         )
         for frame in track.get("frames", []):
@@ -739,9 +994,19 @@ def export_overlay_video(
     start_time = time.time()
     _update_info(info_callback, {"stage": "Rendering overlay"})
     primary_track_id = _select_primary_track(tracks, width, height)
+    debug_transform = None
+    if primary_track_id and primary_track_id in track_transforms:
+        debug_transform = track_transforms[primary_track_id]
+    elif track_transforms:
+        debug_transform = next(iter(track_transforms.values()))
+    else:
+        debug_transform = _build_transform({"source": {}}, width, height)
     smoothing_alpha = min(max(smoothing_alpha, 0.0), 1.0)
     smoothed_cache: dict[str, dict[str, tuple[float, float, float]]] = {}
     logged_keypoints = False
+    logged_mapping_warning = False
+    if debug_overlay:
+        logging.info("Debug overlay enabled: capture a screenshot to validate mapping primitives.")
     while True:
         if cancel_event is not None and getattr(cancel_event, "is_set")():
             cap.release()
@@ -759,6 +1024,7 @@ def export_overlay_video(
             frames_with_multiple += 1
         _draw_watermark(annotated, frame_index, fps)
         if debug_overlay:
+            _draw_debug_regions(annotated, debug_transform, width, height)
             _draw_debug_corners(annotated, width, height)
         if not frame_entries:
             _draw_no_pose(annotated)
@@ -767,6 +1033,17 @@ def export_overlay_video(
             for idx, entry in enumerate(frame_entries):
                 track_id = str(entry.get("track_id", "track"))
                 transform = track_transforms.get(track_id, _build_transform({"source": {}}, width, height))
+                timestamp_ms = float(entry.get("timestamp_ms", 0.0))
+                expected_ts = frame_index / max(1.0, fps) * 1000.0
+                if track_id not in warned_frame_sync and abs(timestamp_ms - expected_ts) > (1000.0 / max(1.0, fps)) * 1.5:
+                    logging.warning(
+                        "Frame sync mismatch track=%s frame=%s timestamp_ms=%.1f expected=%.1f",
+                        track_id,
+                        frame_index,
+                        timestamp_ms,
+                        expected_ts,
+                    )
+                    warned_frame_sync.add(track_id)
                 bbox = entry.get("bbox_xywh")
                 converted_bbox = _convert_bbox(bbox, transform) if bbox is not None else None
                 color = colors[idx % len(colors)]
@@ -780,6 +1057,25 @@ def export_overlay_video(
                 except ValueError as exc:
                     logging.warning("Skipping invalid keypoints for track %s: %s", track_id, exc)
                     continue
+                if mapped:
+                    total_kps = len(mapped)
+                    out_of_bounds = sum(
+                        1
+                        for _, (x, y, _) in mapped.items()
+                        if x < 0 or y < 0 or x >= width or y >= height
+                    )
+                    if total_kps > 0 and out_of_bounds / total_kps >= 0.6 and not logged_mapping_warning:
+                        logging.warning(
+                            "MAPPING BROKEN: %s/%s keypoints out of bounds on frame %s (track=%s)",
+                            out_of_bounds,
+                            total_kps,
+                            frame_index,
+                            track_id,
+                        )
+                        _update_info(info_callback, {"mapping_warning": True})
+                        logged_mapping_warning = True
+                if debug_overlay:
+                    _draw_keypoint_labels(annotated, mapped, color)
                 if not logged_keypoints and frame_index == 0:
                     sample = list(mapped.items())[:3]
                     logging.info("First frame keypoints (converted) track=%s sample=%s", track_id, sample)
@@ -814,6 +1110,7 @@ def export_overlay_video(
             progress = 35 + (frame_index / max(1, total)) * 50
             elapsed = max(0.001, time.time() - start_time)
             effective_fps = frame_index / elapsed
+            realtime_ratio = effective_fps / max(1.0, fps)
             _update_status(
                 status_callback,
                 f"Rendering overlay frame {frame_index}/{total}...",
@@ -826,6 +1123,7 @@ def export_overlay_video(
                     "total_frames": total,
                     "people": pose_count,
                     "effective_fps": effective_fps,
+                    "realtime_ratio": realtime_ratio,
                 },
             )
     cap.release()

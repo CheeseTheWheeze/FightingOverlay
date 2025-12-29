@@ -152,6 +152,14 @@ def configure_dark_theme(root: Tk) -> None:
     style.configure("TProgressbar", troughcolor=surface, background=accent)
 
 
+def format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="FightingOverlay Control Center")
     parser.add_argument("--test-mode", action="store_true", help="Run synthetic test and exit")
@@ -181,14 +189,20 @@ def main() -> None:
     status_var = StringVar(value="Idle")
     run_stage_var = StringVar(value="Idle")
     frame_stats_var = StringVar(value="Frame -/-")
-    fps_var = StringVar(value="FPS: --")
+    fps_var = StringVar(value="Processed FPS: --")
+    source_fps_var = StringVar(value="Source FPS: --")
+    resolution_var = StringVar(value="Resolution: --")
+    duration_var = StringVar(value="Duration: --")
+    inference_var = StringVar(value="Inference: --")
     people_var = StringVar(value="People: --")
+    realtime_var = StringVar(value="Realtime: --")
     error_var = StringVar(value="Last error: None")
 
     export_overlay_var = BooleanVar(value=True)
     save_pose_var = BooleanVar(value=True)
     save_thumbnails_var = BooleanVar(value=False)
     save_background_var = BooleanVar(value=True)
+    debug_overlay_var = BooleanVar(value=False)
     draw_all_tracks_var = BooleanVar(value=False)
     foreground_mode_var = StringVar(value="Auto (closest/most active)")
     manual_tracks_var = StringVar(value="")
@@ -317,12 +331,22 @@ def main() -> None:
 
     ttk.Label(stats_frame, text="Frame", style="Card.TLabel").grid(row=0, column=0, sticky="w")
     ttk.Label(stats_frame, textvariable=frame_stats_var, style="Card.TLabel").grid(row=0, column=1, sticky="w")
-    ttk.Label(stats_frame, text="Effective FPS", style="Card.TLabel").grid(row=1, column=0, sticky="w")
-    ttk.Label(stats_frame, textvariable=fps_var, style="Card.TLabel").grid(row=1, column=1, sticky="w")
-    ttk.Label(stats_frame, text="Last-frame people", style="Card.TLabel").grid(row=2, column=0, sticky="w")
-    ttk.Label(stats_frame, textvariable=people_var, style="Card.TLabel").grid(row=2, column=1, sticky="w")
-    ttk.Label(stats_frame, text="Last error", style="Card.TLabel").grid(row=3, column=0, sticky="w")
-    ttk.Label(stats_frame, textvariable=error_var, style="Card.TLabel").grid(row=3, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Resolution", style="Card.TLabel").grid(row=1, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=resolution_var, style="Card.TLabel").grid(row=1, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Duration", style="Card.TLabel").grid(row=2, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=duration_var, style="Card.TLabel").grid(row=2, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Source FPS", style="Card.TLabel").grid(row=3, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=source_fps_var, style="Card.TLabel").grid(row=3, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Processed FPS", style="Card.TLabel").grid(row=4, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=fps_var, style="Card.TLabel").grid(row=4, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Realtime", style="Card.TLabel").grid(row=5, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=realtime_var, style="Card.TLabel").grid(row=5, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Inference", style="Card.TLabel").grid(row=6, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=inference_var, style="Card.TLabel").grid(row=6, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Last-frame people", style="Card.TLabel").grid(row=7, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=people_var, style="Card.TLabel").grid(row=7, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Last error", style="Card.TLabel").grid(row=8, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=error_var, style="Card.TLabel").grid(row=8, column=1, sticky="w")
 
     ttk.Label(status_frame, text="Last update: " + load_last_update(), style="Card.TLabel").grid(
         row=4, column=0, columnspan=2, sticky="w", pady=(6, 0)
@@ -359,14 +383,20 @@ def main() -> None:
 
     export_overlay_check = ttk.Checkbutton(settings_group, text="Export overlay video (MP4)", variable=export_overlay_var)
     export_overlay_check.grid(row=0, column=0, sticky="w")
+    debug_overlay_check = ttk.Checkbutton(
+        settings_group,
+        text="Debug overlay (mapping primitives)",
+        variable=debug_overlay_var,
+    )
+    debug_overlay_check.grid(row=1, column=0, sticky="w")
     draw_all_tracks_check = ttk.Checkbutton(
         settings_group,
         text="Draw all tracks (debug)",
         variable=draw_all_tracks_var,
     )
-    draw_all_tracks_check.grid(row=1, column=0, sticky="w")
+    draw_all_tracks_check.grid(row=2, column=0, sticky="w")
 
-    ttk.Label(settings_group, text="Tracking backend").grid(row=2, column=0, sticky="w", pady=(8, 2))
+    ttk.Label(settings_group, text="Tracking backend").grid(row=3, column=0, sticky="w", pady=(8, 2))
     backend_combo = ttk.Combobox(
         settings_group,
         textvariable=tracking_backend_var,
@@ -376,9 +406,9 @@ def main() -> None:
         ],
         state="readonly",
     )
-    backend_combo.grid(row=3, column=0, sticky="ew")
+    backend_combo.grid(row=4, column=0, sticky="ew")
 
-    ttk.Label(settings_group, text="Foreground selection mode").grid(row=4, column=0, sticky="w", pady=(8, 2))
+    ttk.Label(settings_group, text="Foreground selection mode").grid(row=5, column=0, sticky="w", pady=(8, 2))
     mode_combo = ttk.Combobox(
         settings_group,
         textvariable=foreground_mode_var,
@@ -389,19 +419,19 @@ def main() -> None:
         ],
         state="readonly",
     )
-    mode_combo.grid(row=5, column=0, sticky="ew")
+    mode_combo.grid(row=6, column=0, sticky="ew")
 
-    ttk.Label(settings_group, text="Manual track IDs (comma-separated)").grid(row=6, column=0, sticky="w", pady=(8, 2))
+    ttk.Label(settings_group, text="Manual track IDs (comma-separated)").grid(row=7, column=0, sticky="w", pady=(8, 2))
     manual_entry = ttk.Entry(settings_group, textvariable=manual_tracks_var)
-    manual_entry.grid(row=7, column=0, sticky="ew")
+    manual_entry.grid(row=8, column=0, sticky="ew")
 
-    ttk.Label(settings_group, text="Smoothing (higher = steadier)").grid(row=8, column=0, sticky="w", pady=(8, 2))
+    ttk.Label(settings_group, text="Smoothing (higher = steadier)").grid(row=9, column=0, sticky="w", pady=(8, 2))
     smoothing_scale = ttk.Scale(settings_group, from_=0.0, to=1.0, variable=smoothing_alpha_var)
-    smoothing_scale.grid(row=9, column=0, sticky="ew")
+    smoothing_scale.grid(row=10, column=0, sticky="ew")
 
-    ttk.Label(settings_group, text="Min keypoint confidence").grid(row=10, column=0, sticky="w", pady=(8, 2))
+    ttk.Label(settings_group, text="Min keypoint confidence").grid(row=11, column=0, sticky="w", pady=(8, 2))
     conf_scale = ttk.Scale(settings_group, from_=0.0, to=1.0, variable=min_conf_var)
-    conf_scale.grid(row=11, column=0, sticky="ew")
+    conf_scale.grid(row=12, column=0, sticky="ew")
 
     update_group = ttk.LabelFrame(settings_tab, text="Updates", padding=12)
     update_group.grid(row=1, column=0, sticky="ew", pady=(12, 0))
@@ -438,6 +468,7 @@ def main() -> None:
             save_thumbnails_check,
             save_background_check,
             export_overlay_check,
+            debug_overlay_check,
             draw_all_tracks_check,
             backend_combo,
             mode_combo,
@@ -476,9 +507,36 @@ def main() -> None:
         if "frame_index" in info and "total_frames" in info:
             frame_stats_var.set(f"Frame {info['frame_index']} / {info['total_frames']}")
         if "effective_fps" in info:
-            fps_var.set(f"FPS: {float(info['effective_fps']):.1f}")
+            fps_var.set(f"{float(info['effective_fps']):.1f} fps")
+        if "realtime_ratio" in info:
+            realtime_var.set(f"{float(info['realtime_ratio']):.2f}x realtime")
         if "people" in info:
             people_var.set(f"People: {info['people']}")
+        if "video_width" in info and "video_height" in info:
+            width = int(info["video_width"])
+            height = int(info["video_height"])
+            mp = (width * height) / 1_000_000
+            resolution_var.set(f"{width} x {height} ({mp:.2f} MP)")
+        if "video_duration_s" in info:
+            duration_var.set(format_duration(float(info["video_duration_s"])))
+        if "video_fps" in info:
+            source_fps_var.set(f"{float(info['video_fps']):.1f} fps")
+        if "infer_width" in info or "infer_height" in info:
+            infer_w = info.get("infer_width")
+            infer_h = info.get("infer_height")
+            resized_w = info.get("resized_width")
+            resized_h = info.get("resized_height")
+            pad_left = info.get("pad_left")
+            pad_right = info.get("pad_right")
+            pad_top = info.get("pad_top")
+            pad_bottom = info.get("pad_bottom")
+            transform_kind = info.get("transform_kind")
+            inference_var.set(
+                f"{transform_kind} infer={infer_w}x{infer_h} resized={resized_w}x{resized_h} "
+                f"pads L{pad_left} R{pad_right} T{pad_top} B{pad_bottom}"
+            )
+        if info.get("mapping_warning"):
+            error_var.set("Mapping warning: keypoints out of bounds")
         if "error" in info:
             error_var.set(f"Last error: {info['error']}")
 
@@ -495,8 +553,13 @@ def main() -> None:
         update_status("Starting processing...", 0)
         run_stage_var.set("Loading video")
         frame_stats_var.set("Frame -/-")
-        fps_var.set("FPS: --")
+        fps_var.set("Processed FPS: --")
+        source_fps_var.set("Source FPS: --")
+        resolution_var.set("Resolution: --")
+        duration_var.set("Duration: --")
+        inference_var.set("Inference: --")
         people_var.set("People: --")
+        realtime_var.set("Realtime: --")
         error_var.set("Last error: None")
 
         def status_callback(message: str, progress_value: float | None) -> None:
@@ -521,6 +584,7 @@ def main() -> None:
                     save_thumbnails=save_thumbnails_var.get(),
                     save_background_tracks=save_background_var.get(),
                     foreground_mode=mode,
+                    debug_overlay=debug_overlay_var.get(),
                     draw_all_tracks=draw_all_tracks_var.get(),
                     smoothing_alpha=float(smoothing_alpha_var.get()),
                     min_keypoint_confidence=float(min_conf_var.get()),
