@@ -9,15 +9,19 @@ import subprocess
 import threading
 import urllib.error
 import urllib.request
+import webbrowser
+from datetime import datetime
 from pathlib import Path
 from tkinter import BooleanVar, DoubleVar, IntVar, PhotoImage, StringVar, Text, Tk, filedialog, messagebox, ttk
+
+import cv2  # type: ignore
 
 from core.paths import (
     get_app_root,
     get_bootstrapper_path,
     get_current_pointer,
-    get_data_root,
     get_last_update_path,
+    get_update_history_path,
     get_log_root,
     get_outputs_root,
 )
@@ -26,6 +30,13 @@ from core.settings import load_settings, save_settings
 from core.schema import validate_pose_tracks_schema
 
 RELEASES_URL = "https://api.github.com/repos/CheeseTheWheeze/FightingOverlay/releases/latest"
+
+OVERLAY_OPTIONS = {
+    "Skeleton overlay": {"slug": "skeleton", "file": "overlay_skeleton.mp4"},
+    "Joints-only overlay": {"slug": "joints", "file": "overlay_joints.mp4"},
+    "Balance overlay": {"slug": "balance", "file": "overlay_balance.mp4"},
+    "Debug overlay": {"slug": "debug", "file": "overlay_debug.mp4"},
+}
 
 
 class TkTextHandler(logging.Handler):
@@ -87,17 +98,63 @@ def open_folder(path: Path) -> None:
     subprocess.run(["explorer", str(path)], check=False)
 
 
-def check_updates() -> tuple[bool, str]:
+def fetch_latest_release() -> dict:
+    logging.info("Update check: GET %s", RELEASES_URL)
     request = urllib.request.Request(
         RELEASES_URL,
         headers={"Accept": "application/vnd.github+json", "User-Agent": "FightingOverlayControlCenter"},
     )
     with urllib.request.urlopen(request, timeout=15) as response:
         payload = response.read().decode("utf-8")
-    data = json.loads(payload)
-    latest = data.get("tag_name") or data.get("name") or "unknown"
-    current = get_current_version()
-    return latest != current, latest
+    return json.loads(payload)
+
+
+def summarize_release_notes(body: str, max_lines: int = 10) -> str:
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    return "\n".join(lines[:max_lines]) if lines else "No release notes provided."
+
+
+def load_update_history() -> list[dict[str, str]]:
+    path = get_update_history_path()
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [entry for entry in payload if isinstance(entry, dict)]
+
+
+def write_update_history(entries: list[dict[str, str]]) -> None:
+    path = get_update_history_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+
+
+def sync_update_history() -> None:
+    last_update = get_last_update_path()
+    if not last_update.exists():
+        return
+    try:
+        payload = json.loads(last_update.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    if not isinstance(payload, dict):
+        return
+    history = load_update_history()
+    if history and history[0].get("timestamp") == payload.get("timestamp"):
+        return
+    entry = {
+        "previous_version": payload.get("previous_version", "unknown"),
+        "new_version": payload.get("version", "unknown"),
+        "timestamp": payload.get("timestamp", ""),
+        "status": payload.get("status", ""),
+        "error": payload.get("message", ""),
+    }
+    history.insert(0, entry)
+    write_update_history(history[:50])
 
 
 def run_bootstrap_update() -> tuple[bool, str]:
@@ -114,6 +171,8 @@ def load_last_update() -> str:
         return "No updates yet"
     try:
         payload = json.loads(last_update.read_text(encoding="utf-8"))
+        if "previous_version" not in payload:
+            payload["previous_version"] = "unknown"
         return f"{payload.get('status')} ({payload.get('version')}) {payload.get('timestamp')}"
     except json.JSONDecodeError:
         return "Update log unreadable"
@@ -175,12 +234,12 @@ def main() -> None:
     defaults = {
         "debug_overlay": False,
         "draw_all_tracks": False,
-        "render_mode": "Skeleton (lines+dots)",
+        "overlay_mode": "Skeleton overlay",
         "confidence_threshold": 0.3,
         "smoothing_enabled": True,
         "smoothing_alpha": 0.7,
         "max_tracks": 3,
-        "track_sort": "Top confidence",
+        "track_sort": "Stability score",
         "live_preview": True,
         "run_evaluation": False,
         "export_overlay": True,
@@ -192,8 +251,12 @@ def main() -> None:
         "manual_track_ids": "",
         "last_video_path": "",
         "last_output_path": str(get_outputs_root()),
+        "update_channel": "Stable",
+        "last_update_check": "",
+        "last_selected_tab": "Run / Processing",
     }
     settings = load_settings(defaults)
+    sync_update_history()
 
     if args.test_mode:
         options = ProcessingOptions(
@@ -227,6 +290,13 @@ def main() -> None:
     evaluation_var = StringVar(value="Evaluation: --")
     preview_stats_var = StringVar(value="Preview -/-")
     all_tracks_warning_var = StringVar(value="")
+    update_status_var = StringVar(value="Up to date")
+    update_channel_var = StringVar(value=str(settings.get("update_channel") or "Stable"))
+    update_last_checked_var = StringVar(value=str(settings.get("last_update_check") or "Never"))
+    update_latest_version_var = StringVar(value="Latest: --")
+    update_release_notes_var = StringVar(value="Release notes will appear after a check.")
+    update_error_var = StringVar(value="")
+    viewer_status_var = StringVar(value="Viewer idle")
 
     export_overlay_var = BooleanVar(value=bool(settings.get("export_overlay")))
     save_pose_var = BooleanVar(value=bool(settings.get("save_pose_json")))
@@ -234,7 +304,7 @@ def main() -> None:
     save_background_var = BooleanVar(value=bool(settings.get("save_background_tracks")))
     debug_overlay_var = BooleanVar(value=bool(settings.get("debug_overlay")))
     draw_all_tracks_var = BooleanVar(value=bool(settings.get("draw_all_tracks")))
-    render_mode_var = StringVar(value=str(settings.get("render_mode")))
+    overlay_mode_var = StringVar(value=str(settings.get("overlay_mode")))
     max_tracks_var = IntVar(value=int(settings.get("max_tracks") or 3))
     track_sort_var = StringVar(value=str(settings.get("track_sort")))
     live_preview_var = BooleanVar(value=bool(settings.get("live_preview")))
@@ -247,6 +317,11 @@ def main() -> None:
     tracking_backend_var = StringVar(value=str(settings.get("tracking_backend")))
 
     cancel_event = threading.Event()
+
+    if overlay_mode_var.get() not in OVERLAY_OPTIONS:
+        overlay_mode_var.set("Skeleton overlay")
+    if track_sort_var.get() != "Stability score":
+        track_sort_var.set("Stability score")
 
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=1)
@@ -276,8 +351,23 @@ def main() -> None:
     notebook.add(data_tab, text="Data & Storage")
     notebook.add(settings_tab, text="Settings")
 
+    last_tab = settings.get("last_selected_tab")
+    if last_tab:
+        for tab_id in notebook.tabs():
+            if notebook.tab(tab_id, "text") == last_tab:
+                notebook.select(tab_id)
+                break
+
+    def on_tab_changed(_event: object) -> None:
+        selected = notebook.tab(notebook.select(), "text")
+        settings["last_selected_tab"] = selected
+        save_settings(settings)
+
+    notebook.bind("<<NotebookTabChanged>>", on_tab_changed)
+
     run_tab.columnconfigure(1, weight=1)
     run_tab.rowconfigure(5, weight=1)
+    run_tab.rowconfigure(6, weight=1)
 
     ttk.Label(run_tab, text="Source Video", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
     ttk.Label(run_tab, textvariable=selected_video, style="Card.TLabel").grid(
@@ -301,24 +391,160 @@ def main() -> None:
     def on_open_logs() -> None:
         open_folder(get_log_root())
 
-    def on_check_updates() -> None:
-        try:
-            update_available, latest = check_updates()
-        except urllib.error.HTTPError as error:
-            messagebox.showerror("Updates", f"Failed to check updates: {error}")
-            return
-        if update_available:
-            messagebox.showinfo("Updates", f"Update available: {latest}")
-        else:
-            messagebox.showinfo("Updates", "You are up to date.")
+    def overlay_slug(label: str) -> str:
+        return OVERLAY_OPTIONS.get(label, OVERLAY_OPTIONS["Skeleton overlay"])["slug"]
 
-    def on_update_now() -> None:
+    def overlay_file(label: str) -> Path:
+        filename = OVERLAY_OPTIONS.get(label, OVERLAY_OPTIONS["Skeleton overlay"])["file"]
+        return get_outputs_root() / filename
+
+    def refresh_update_history_list() -> None:
+        history = load_update_history()
+        entries = history[:5]
+        update_history_text.configure(state="normal")
+        update_history_text.delete("1.0", "end")
+        if not entries:
+            update_history_text.insert("end", "No updates recorded yet.")
+        else:
+            for entry in entries:
+                status = entry.get("status", "unknown")
+                before = entry.get("previous_version", "unknown")
+                after = entry.get("new_version", "unknown")
+                timestamp = entry.get("timestamp", "")
+                error = entry.get("error", "")
+                line = f"{timestamp} | {before} -> {after} | {status}"
+                if error:
+                    line += f" | {error}"
+                update_history_text.insert("end", line + "\n")
+        update_history_text.configure(state="disabled")
+
+    def set_release_notes(text: str) -> None:
+        update_notes_text.configure(state="normal")
+        update_notes_text.delete("1.0", "end")
+        update_notes_text.insert("end", text)
+        update_notes_text.configure(state="disabled")
+
+    def on_check_updates() -> None:
+        update_status_var.set("Checking...")
+        update_error_var.set("")
+        checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        update_last_checked_var.set(checked_at)
+        save_setting("last_update_check", checked_at)
+
+        def _run_check() -> None:
+            try:
+                release = fetch_latest_release()
+                latest = release.get("tag_name") or release.get("name") or "unknown"
+                notes = summarize_release_notes(release.get("body", ""))
+                update_url = release.get("html_url", "")
+                update_state["latest_version"] = latest
+                update_state["release_notes"] = notes
+                update_state["release_url"] = update_url
+                current = get_current_version()
+                logging.info("Update check: current=%s latest=%s url=%s", current, latest, update_url)
+
+                def _apply() -> None:
+                    label = latest if str(latest).startswith("v") else f"v{latest}"
+                    update_latest_version_var.set(f"Latest version: {label}")
+                    set_release_notes(notes)
+                    if latest != "unknown" and current != "unknown" and latest != current:
+                        update_status_var.set("Update available")
+                        update_action_button.configure(state="normal")
+                    else:
+                        update_status_var.set("Up to date")
+                        update_action_button.configure(state="disabled")
+                    refresh_update_history_list()
+
+                root.after(0, _apply)
+            except urllib.error.HTTPError as error:
+                message = f"HTTP error {error.code}"
+                if error.code == 403:
+                    message += " (rate limit)"
+                logging.error("Update check failed: %s", message)
+
+                def _apply_error() -> None:
+                    update_status_var.set("Error")
+                    update_error_var.set(message)
+                    update_action_button.configure(state="disabled")
+                    set_release_notes("Release notes unavailable due to error.")
+
+                root.after(0, _apply_error)
+            except Exception as exc:
+                logging.exception("Update check failed: %s", exc)
+
+                def _apply_exc() -> None:
+                    update_status_var.set("Error")
+                    update_error_var.set(str(exc))
+                    update_action_button.configure(state="disabled")
+                    set_release_notes("Release notes unavailable due to error.")
+
+                root.after(0, _apply_exc)
+
+        threading.Thread(target=_run_check, daemon=True).start()
+
+    def show_restart_modal(countdown: int = 3) -> None:
+        modal = ttk.Frame(root, padding=16, style="Card.TFrame")
+        modal.place(relx=0.5, rely=0.5, anchor="center")
+        modal.columnconfigure(0, weight=1)
+        label_var = StringVar(value=f"Update installed. Restarting now in {countdown}...")
+        ttk.Label(modal, textvariable=label_var, style="Card.TLabel").grid(row=0, column=0, pady=(0, 8))
+        update_status_var.set("Restarting...")
+        def on_restart_now() -> None:
+            root.destroy()
+        restart_button = ttk.Button(modal, text="Restart now", style="Accent.TButton", command=on_restart_now)
+        restart_button.grid(row=1, column=0, sticky="ew")
+
+        def tick(remaining: int) -> None:
+            if remaining <= 0:
+                root.destroy()
+                return
+            label_var.set(f"Update installed. Restarting now in {remaining}...")
+            root.after(1000, tick, remaining - 1)
+
+        root.after(1000, tick, countdown - 1)
+
+    def trigger_update(allow_running: bool = False) -> None:
+        if processing_state["running"] and not allow_running:
+            if messagebox.askyesno(
+                "Update",
+                "Processing is running. Install after completion?",
+            ):
+                install_after_job["pending"] = True
+                update_status_var.set("Update scheduled after job")
+            return
+        update_status_var.set("Downloading...")
+        update_error_var.set("")
+        update_action_button.configure(state="disabled")
+        logging.info("Update requested: current=%s latest=%s", get_current_version(), update_state.get("latest_version"))
         success, message = run_bootstrap_update()
         if success:
-            messagebox.showinfo("Update", message)
-            root.destroy()
+            update_status_var.set("Applying...")
+            show_restart_modal()
         else:
-            messagebox.showerror("Update", message)
+            update_status_var.set("Error")
+            update_error_var.set(message)
+
+    def on_update_now() -> None:
+        if update_status_var.get() != "Update available":
+            messagebox.showinfo("Update", "No update is available right now.")
+            return
+        trigger_update()
+
+    def on_bootstrap_repair() -> None:
+        current = get_current_version()
+        latest = update_state.get("latest_version") or current
+        if latest == current:
+            messagebox.showinfo("Bootstrap / Repair", "No changes needed. You are already on the latest version.")
+            return
+        messagebox.showinfo("Bootstrap / Repair", f"Updating from v{current} to v{latest}.")
+        trigger_update()
+
+    def on_open_release_notes() -> None:
+        url = update_state.get("release_url")
+        if url:
+            webbrowser.open(url)
+        else:
+            messagebox.showinfo("Updates", "No release notes URL available yet.")
 
     def on_validate() -> None:
         ok, message = validate_output_schema()
@@ -329,6 +555,9 @@ def main() -> None:
 
     action_buttons: list[ttk.Button] = []
     settings_controls: list[ttk.Widget] = []
+    update_state: dict[str, str] = {"latest_version": "", "release_notes": "", "release_url": ""}
+    install_after_job = {"pending": False}
+    processing_state = {"running": False}
 
     run_actions = ttk.Frame(run_tab)
     run_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
@@ -408,19 +637,19 @@ def main() -> None:
 
     draw_all_warning = ttk.Label(
         advanced_frame,
-        text="All-tracks view can look cluttered; use Dots-only + Top-N filter.",
+        text="All-tracks view can look cluttered; use Joints-only or lower the Top-N cap.",
         style="Card.TLabel",
     )
     draw_all_warning.grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 6))
 
-    ttk.Label(advanced_frame, text="Render mode", style="Card.TLabel").grid(row=5, column=0, sticky="w")
-    render_mode_combo = ttk.Combobox(
+    ttk.Label(advanced_frame, text="Overlay mode", style="Card.TLabel").grid(row=5, column=0, sticky="w")
+    overlay_mode_combo = ttk.Combobox(
         advanced_frame,
-        textvariable=render_mode_var,
-        values=["Dots only", "Skeleton (lines+dots)"],
+        textvariable=overlay_mode_var,
+        values=list(OVERLAY_OPTIONS.keys()),
         state="readonly",
     )
-    render_mode_combo.grid(row=5, column=1, sticky="ew")
+    overlay_mode_combo.grid(row=5, column=1, sticky="ew")
 
     ttk.Label(advanced_frame, text="Confidence threshold", style="Card.TLabel").grid(row=6, column=0, sticky="w")
     conf_scale = ttk.Scale(advanced_frame, from_=0.0, to=1.0, variable=min_conf_var)
@@ -435,15 +664,19 @@ def main() -> None:
     smoothing_scale = ttk.Scale(advanced_frame, from_=0.0, to=1.0, variable=smoothing_alpha_var)
     smoothing_scale.grid(row=7, column=1, sticky="ew")
 
-    ttk.Label(advanced_frame, text="Max tracks (all-tracks)", style="Card.TLabel").grid(row=8, column=0, sticky="w")
-    max_tracks_spin = ttk.Spinbox(advanced_frame, from_=1, to=10, textvariable=max_tracks_var, width=5)
+    ttk.Label(
+        advanced_frame,
+        text="Top-N tracks cap (debug limiter)",
+        style="Card.TLabel",
+    ).grid(row=8, column=0, sticky="w")
+    max_tracks_spin = ttk.Spinbox(advanced_frame, from_=1, to=50, textvariable=max_tracks_var, width=5)
     max_tracks_spin.grid(row=8, column=1, sticky="w")
 
     ttk.Label(advanced_frame, text="Track ranking", style="Card.TLabel").grid(row=9, column=0, sticky="w")
     track_sort_combo = ttk.Combobox(
         advanced_frame,
         textvariable=track_sort_var,
-        values=["Top confidence", "Most continuous"],
+        values=["Stability score"],
         state="readonly",
     )
     track_sort_combo.grid(row=9, column=1, sticky="ew")
@@ -481,7 +714,7 @@ def main() -> None:
 
     live_preview_check = ttk.Checkbutton(
         advanced_frame,
-        text="Live preview while processing",
+        text="Live preview",
         variable=live_preview_var,
     )
     live_preview_check.grid(row=13, column=0, sticky="w")
@@ -496,7 +729,7 @@ def main() -> None:
     reset_button.grid(row=14, column=1, sticky="e", pady=(6, 0))
 
     quick_actions = ttk.Frame(run_tab, padding=8, style="Card.TFrame")
-    quick_actions.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+    quick_actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(10, 0))
     quick_actions.columnconfigure(0, weight=1)
     quick_actions.columnconfigure(1, weight=1)
 
@@ -560,8 +793,118 @@ def main() -> None:
     preview_label = ttk.Label(preview_frame, text="Preview will appear while processing", style="Card.TLabel")
     preview_label.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
 
+    output_frame = ttk.Frame(run_tab, padding=12, style="Card.TFrame")
+    output_frame.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
+    output_frame.columnconfigure(1, weight=1)
+
+    ttk.Label(output_frame, text="Results Viewer", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(output_frame, textvariable=viewer_status_var, style="Card.TLabel").grid(row=0, column=1, sticky="e")
+
+    ttk.Label(output_frame, text="Overlay", style="Card.TLabel").grid(row=1, column=0, sticky="w")
+    viewer_overlay_combo = ttk.Combobox(
+        output_frame,
+        textvariable=overlay_mode_var,
+        values=list(OVERLAY_OPTIONS.keys()),
+        state="readonly",
+    )
+    viewer_overlay_combo.grid(row=1, column=1, sticky="ew")
+
+    viewer_label = ttk.Label(output_frame, text="Output video will appear after processing", style="Card.TLabel")
+    viewer_label.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+
+    viewer_controls = ttk.Frame(output_frame)
+    viewer_controls.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+    viewer_controls.columnconfigure(0, weight=1)
+    viewer_controls.columnconfigure(1, weight=1)
+    viewer_controls.columnconfigure(2, weight=1)
+
+    viewer_state = {"cap": None, "playing": False, "after_id": None, "fps": 30.0}
+
+    def stop_viewer() -> None:
+        if viewer_state["after_id"]:
+            root.after_cancel(viewer_state["after_id"])
+        viewer_state["after_id"] = None
+        viewer_state["playing"] = False
+        cap = viewer_state["cap"]
+        if cap is not None:
+            cap.release()
+        viewer_state["cap"] = None
+
+    def show_viewer_frame(frame) -> None:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        ok, buffer = cv2.imencode(".png", rgb)
+        if not ok:
+            return
+        encoded = base64.b64encode(buffer.tobytes()).decode("ascii")
+        image = PhotoImage(data=encoded)
+        viewer_label.configure(image=image, text="")
+        viewer_label.image = image
+
+    def load_viewer_video() -> None:
+        stop_viewer()
+        path = overlay_file(overlay_mode_var.get())
+        if not path.exists():
+            viewer_status_var.set("Viewer idle")
+            viewer_label.configure(image="", text=f"No output found: {path.name}")
+            return
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            viewer_status_var.set("Viewer idle")
+            viewer_label.configure(image="", text="Unable to open output video")
+            return
+        viewer_state["cap"] = cap
+        viewer_state["fps"] = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        ret, frame = cap.read()
+        if ret:
+            show_viewer_frame(frame)
+            viewer_status_var.set(f"Loaded {path.name}")
+        else:
+            viewer_label.configure(image="", text="Output video empty")
+            viewer_status_var.set("Viewer idle")
+
+    def play_viewer() -> None:
+        if viewer_state["cap"] is None:
+            load_viewer_video()
+        if viewer_state["cap"] is None:
+            return
+        viewer_state["playing"] = True
+
+        def _step() -> None:
+            cap = viewer_state["cap"]
+            if cap is None or not viewer_state["playing"]:
+                return
+            ret, frame = cap.read()
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+            if ret:
+                show_viewer_frame(frame)
+            delay_ms = int(1000 / max(1.0, viewer_state["fps"]))
+            viewer_state["after_id"] = root.after(delay_ms, _step)
+
+        _step()
+        viewer_status_var.set("Playing")
+
+    def pause_viewer() -> None:
+        viewer_state["playing"] = False
+        viewer_status_var.set("Paused")
+
+    def restart_viewer() -> None:
+        if viewer_state["cap"] is not None:
+            viewer_state["cap"].set(cv2.CAP_PROP_POS_FRAMES, 0)
+        play_viewer()
+
+    viewer_play_button = ttk.Button(viewer_controls, text="Play", command=play_viewer)
+    viewer_pause_button = ttk.Button(viewer_controls, text="Pause", command=pause_viewer)
+    viewer_restart_button = ttk.Button(viewer_controls, text="Restart", command=restart_viewer)
+    viewer_play_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    viewer_pause_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+    viewer_restart_button.grid(row=0, column=2, sticky="ew")
+
+    overlay_mode_var.trace_add("write", lambda *_: load_viewer_video())
+
     problems_frame = ttk.Frame(run_tab, padding=12, style="Card.TFrame")
-    problems_frame.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+    problems_frame.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(0, 8))
     problems_frame.columnconfigure(0, weight=1)
 
     ttk.Label(problems_frame, text="Problems", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
@@ -590,14 +933,64 @@ def main() -> None:
 
     update_group = ttk.LabelFrame(settings_tab, text="Updates", padding=12)
     update_group.grid(row=0, column=0, sticky="ew")
-
-    updates_button = ttk.Button(update_group, text="Check Updates", command=on_check_updates)
-    update_now_button = ttk.Button(update_group, text="Update Now", style="Accent.TButton", command=on_update_now)
-    updates_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-    update_now_button.grid(row=0, column=1, sticky="ew")
-
-    update_group.columnconfigure(0, weight=1)
     update_group.columnconfigure(1, weight=1)
+
+    ttk.Label(update_group, text="Current version", style="Card.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(update_group, text=f"v{get_current_version()}", style="Card.TLabel").grid(row=0, column=1, sticky="w")
+
+    ttk.Label(update_group, text="Update channel", style="Card.TLabel").grid(row=1, column=0, sticky="w")
+    channel_combo = ttk.Combobox(
+        update_group,
+        textvariable=update_channel_var,
+        values=["Stable", "Beta"],
+        state="readonly",
+    )
+    channel_combo.grid(row=1, column=1, sticky="w")
+
+    ttk.Label(update_group, text="Last checked", style="Card.TLabel").grid(row=2, column=0, sticky="w")
+    ttk.Label(update_group, textvariable=update_last_checked_var, style="Card.TLabel").grid(row=2, column=1, sticky="w")
+
+    ttk.Label(update_group, text="Status", style="Card.TLabel").grid(row=3, column=0, sticky="w")
+    ttk.Label(update_group, textvariable=update_status_var, style="Card.TLabel").grid(row=3, column=1, sticky="w")
+
+    ttk.Label(update_group, text="Latest version", style="Card.TLabel").grid(row=4, column=0, sticky="w")
+    ttk.Label(update_group, textvariable=update_latest_version_var, style="Card.TLabel").grid(row=4, column=1, sticky="w")
+
+    ttk.Label(update_group, text="Release notes", style="Card.TLabel").grid(row=5, column=0, sticky="nw")
+    update_notes_text = Text(update_group, height=6, bg="#0f1216", fg="#e7e9ee", relief="flat")
+    update_notes_text.grid(row=5, column=1, sticky="ew")
+    update_notes_text.configure(state="disabled")
+
+    update_error_label = ttk.Label(update_group, textvariable=update_error_var, style="Card.TLabel", foreground="#f2994a")
+    update_error_label.grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+    update_actions = ttk.Frame(update_group)
+    update_actions.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+    update_actions.columnconfigure(0, weight=1)
+    update_actions.columnconfigure(1, weight=1)
+    update_actions.columnconfigure(2, weight=1)
+    update_actions.columnconfigure(3, weight=1)
+
+    update_check_button = ttk.Button(update_actions, text="Check updates", command=on_check_updates)
+    update_action_button = ttk.Button(update_actions, text="Download & install", style="Accent.TButton", command=on_update_now)
+    open_notes_button = ttk.Button(update_actions, text="Open full notes", command=on_open_release_notes)
+    bootstrap_button = ttk.Button(update_actions, text="Bootstrap / Repair", command=on_bootstrap_repair)
+
+    update_check_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    update_action_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+    open_notes_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
+    bootstrap_button.grid(row=0, column=3, sticky="ew")
+    update_action_button.configure(state="disabled")
+
+    ttk.Label(update_group, text="Update history (last 5)", style="Card.TLabel").grid(
+        row=8, column=0, sticky="nw", pady=(8, 0)
+    )
+    update_history_text = Text(update_group, height=5, bg="#0f1216", fg="#e7e9ee", relief="flat")
+    update_history_text.grid(row=8, column=1, sticky="ew", pady=(8, 0))
+    update_history_text.configure(state="disabled")
+
+    set_release_notes(update_release_notes_var.get())
+    refresh_update_history_list()
 
     log_frame = ttk.LabelFrame(container, text="Logs", padding=8)
     log_frame.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
@@ -626,7 +1019,7 @@ def main() -> None:
             export_overlay_check,
             debug_overlay_check,
             draw_all_tracks_check,
-            render_mode_combo,
+            overlay_mode_combo,
             max_tracks_spin,
             track_sort_combo,
             live_preview_check,
@@ -660,7 +1053,7 @@ def main() -> None:
     bind_setting(save_background_var, "save_background_tracks", bool)
     bind_setting(debug_overlay_var, "debug_overlay", bool)
     bind_setting(draw_all_tracks_var, "draw_all_tracks", bool)
-    bind_setting(render_mode_var, "render_mode", str)
+    bind_setting(overlay_mode_var, "overlay_mode", str)
     bind_setting(max_tracks_var, "max_tracks", int)
     bind_setting(track_sort_var, "track_sort", str)
     bind_setting(live_preview_var, "live_preview", bool)
@@ -671,13 +1064,27 @@ def main() -> None:
     bind_setting(tracking_backend_var, "tracking_backend", str)
     bind_setting(foreground_mode_var, "foreground_mode", str)
     bind_setting(manual_tracks_var, "manual_track_ids", str)
+    bind_setting(update_channel_var, "update_channel", str)
+
+    def clamp_max_tracks() -> None:
+        try:
+            value = int(max_tracks_var.get())
+        except Exception:
+            value = defaults["max_tracks"]
+        if value < 1:
+            max_tracks_var.set(1)
+        elif value > 50:
+            max_tracks_var.set(50)
+
+    max_tracks_var.trace_add("write", lambda *_: clamp_max_tracks())
+
 
     def update_draw_all_warning() -> None:
         if draw_all_tracks_var.get():
             draw_all_warning.grid()
-            all_tracks_warning_var.set("All-tracks view can look cluttered; use Dots-only + Top-N filter.")
-            if render_mode_var.get() != "Dots only":
-                render_mode_var.set("Dots only")
+            all_tracks_warning_var.set(
+                "All-tracks view can look cluttered; consider Joints-only or reduce Top-N tracks."
+            )
         else:
             draw_all_warning.grid_remove()
             all_tracks_warning_var.set("")
@@ -692,7 +1099,7 @@ def main() -> None:
         save_background_var.set(defaults["save_background_tracks"])
         debug_overlay_var.set(defaults["debug_overlay"])
         draw_all_tracks_var.set(defaults["draw_all_tracks"])
-        render_mode_var.set(defaults["render_mode"])
+        overlay_mode_var.set(defaults["overlay_mode"])
         max_tracks_var.set(defaults["max_tracks"])
         track_sort_var.set(defaults["track_sort"])
         live_preview_var.set(defaults["live_preview"])
@@ -712,12 +1119,14 @@ def main() -> None:
 
     def set_running(running: bool) -> None:
         state = "disabled" if running else "normal"
+        processing_state["running"] = running
         for button in action_buttons:
             button.configure(state=state)
         outputs_button.configure(state=state)
         logs_button.configure(state=state)
-        updates_button.configure(state=state)
-        update_now_button.configure(state=state)
+        update_check_button.configure(state="normal")
+        update_action_button.configure(state="normal" if update_status_var.get() == "Update available" else "disabled")
+        bootstrap_button.configure(state="normal")
         quick_outputs.configure(state=state)
         quick_logs.configure(state=state)
         for widget in settings_controls:
@@ -773,6 +1182,12 @@ def main() -> None:
             error_var.set(f"Last error: {info['error']}")
         if "evaluation_summary" in info:
             evaluation_var.set(f"Evaluation: {info['evaluation_summary']}")
+        if "evaluation_warning" in info:
+            problem_buffer.appendleft(f"[EVAL] {info['evaluation_warning']}")
+            problems_list.configure(state="normal")
+            problems_list.delete("1.0", "end")
+            problems_list.insert("end", "\n".join(problem_buffer))
+            problems_list.configure(state="disabled")
         if "problem" in info:
             problem = info.get("problem", {})
             if isinstance(problem, dict):
@@ -842,8 +1257,8 @@ def main() -> None:
                     root.after(0, messagebox.showwarning, "Run Overlay", "Enter track IDs for Manual pick mode.")
                     root.after(0, set_running, False)
                     return
-                render_mode = "dots" if render_mode_var.get().lower().startswith("dots") else "skeleton"
-                track_sort = "continuity" if track_sort_var.get().lower().startswith("most") else "confidence"
+                overlay_mode = overlay_slug(overlay_mode_var.get())
+                track_sort = "stability"
                 options = ProcessingOptions(
                     export_overlay_video=export_overlay_var.get(),
                     save_pose_json=save_pose_var.get(),
@@ -855,8 +1270,8 @@ def main() -> None:
                     smoothing_alpha=float(smoothing_alpha_var.get()),
                     smoothing_enabled=smoothing_enabled_var.get(),
                     min_keypoint_confidence=float(min_conf_var.get()),
-                    render_mode=render_mode,
-                    max_tracks=int(max_tracks_var.get()),
+                    overlay_mode=overlay_mode,
+                    max_tracks=max(1, min(int(max_tracks_var.get()), 50)),
                     track_sort=track_sort,
                     live_preview=live_preview_var.get(),
                     run_evaluation=run_evaluation_var.get(),
@@ -871,6 +1286,7 @@ def main() -> None:
                     info_callback,
                 )
                 logging.info("Processing finished. Output: %s", pose_path)
+                root.after(0, load_viewer_video)
                 root.after(0, messagebox.showinfo, "Run Overlay", "Processing complete.")
             except ProcessingCancelled:
                 logging.warning("Processing cancelled by user.")
@@ -882,7 +1298,13 @@ def main() -> None:
                 root.after(0, messagebox.showerror, "Run Overlay", f"Processing failed: {exc}")
                 root.after(0, update_status, "Processing failed.", 0)
             finally:
-                root.after(0, set_running, False)
+                def _finish() -> None:
+                    set_running(False)
+                    if install_after_job["pending"]:
+                        install_after_job["pending"] = False
+                        trigger_update(allow_running=True)
+
+                root.after(0, _finish)
 
         thread = threading.Thread(target=run_background, daemon=True)
         thread.start()
@@ -890,12 +1312,13 @@ def main() -> None:
     run_button.configure(command=on_run_overlay)
 
     validate_button = ttk.Button(run_tab, text="Validate Output JSON schema", command=on_validate)
-    validate_button.grid(row=8, column=0, sticky="w", pady=(6, 0))
+    validate_button.grid(row=9, column=0, sticky="w", pady=(6, 0))
 
     action_buttons.append(validate_button)
 
     set_running(False)
     logging.info("Control Center UI ready")
+    load_viewer_video()
 
     root.mainloop()
 

@@ -89,12 +89,18 @@ def atomic_write(path: Path, content: str) -> None:
     os.replace(temp_path, path)
 
 
-def record_last_update(status: str, version: str | None, message: str | None = None) -> None:
+def record_last_update(
+    status: str,
+    version: str | None,
+    message: str | None = None,
+    previous_version: str | None = None,
+) -> None:
     payload = {
         "status": status,
         "version": version,
         "message": message,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "previous_version": previous_version,
     }
     get_last_update_path().write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -230,10 +236,10 @@ def main() -> int:
         release = fetch_latest_release()
     except urllib.error.HTTPError as error:
         if error.code == 404:
-            record_last_update("no_release", None, "No release published yet")
+            record_last_update("no_release", None, "No release published yet", previous_version)
             show_message("FightingOverlay", "No release published yet")
             return 0
-        record_last_update("error", None, f"HTTP error {error.code}")
+        record_last_update("error", None, f"HTTP error {error.code}", previous_version)
         raise
 
     version = release.get("tag_name") or release.get("name") or "unknown"
@@ -245,12 +251,12 @@ def main() -> int:
             copy_bootstrapper(version)
         except PermissionError as exc:
             logging.warning("Bootstrapper update skipped due to permission error: %s", exc)
-        record_last_update("success", version, "Installed successfully")
+        record_last_update("success", version, "Installed successfully", previous_version)
         clean_old_versions(version, previous_version)
         launch_control_center(target_dir)
     except Exception as exc:
         logging.exception("Bootstrap failed")
-        record_last_update("error", version, str(exc))
+        record_last_update("error", version, str(exc), previous_version)
         show_message("FightingOverlay", f"Install/update failed: {exc}")
         return 1
 

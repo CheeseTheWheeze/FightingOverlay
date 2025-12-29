@@ -52,6 +52,10 @@ def get_last_update_path() -> Path:
     return get_app_root() / "last_update.json"
 
 
+def get_update_history_path() -> Path:
+    return get_app_root() / "update_history.json"
+
+
 def get_bootstrap_root() -> Path:
     return _require_local_appdata() / APP_NAME / "bootstrap"
 

@@ -31,7 +31,7 @@ class ProcessingOptions:
     smoothing_alpha: float = 0.7
     smoothing_enabled: bool = True
     min_keypoint_confidence: float = 0.3
-    render_mode: str = "skeleton"
+    overlay_mode: str = "skeleton"
     max_tracks: int = 3
     track_sort: str = "confidence"
     live_preview: bool = True
@@ -388,6 +388,7 @@ def build_pose_payload(
             "fps": video_meta["fps"],
             "width": video_meta["width"],
             "height": video_meta["height"],
+            "frame_count": video_meta.get("frame_count"),
         },
         "tracks": tracks,
     }
@@ -1076,13 +1077,79 @@ def _draw_pose_overlay(
             if a in mapped and b in mapped:
                 ax, ay, ac = mapped[a]
                 bx, by, bc = mapped[b]
-                if ac > min_confidence and bc > min_confidence:
+                if ac >= min_confidence and bc >= min_confidence:
                     cv2.line(frame, (ax, ay), (bx, by), color, 2)
     for _, (x, y, conf) in mapped.items():
-        if conf > min_confidence:
+        if conf >= min_confidence:
             cv2.circle(frame, (x, y), 3, color, -1)
 
 
+def _center_of_mass(mapped: dict[str, tuple[int, int, float]], min_confidence: float) -> tuple[int, int] | None:
+    if not mapped:
+        return None
+    xs = [x for x, _, conf in mapped.values() if conf >= min_confidence]
+    ys = [y for _, y, conf in mapped.values() if conf >= min_confidence]
+    if not xs or not ys:
+        return None
+    return int(round(sum(xs) / len(xs))), int(round(sum(ys) / len(ys)))
+
+
+def _draw_balance_overlay(
+    frame,
+    mapped: dict[str, tuple[int, int, float]],
+    min_confidence: float,
+    color: tuple[int, int, int],
+) -> None:
+    if cv2 is None:
+        return
+    com = _center_of_mass(mapped, min_confidence)
+    left_ankle = mapped.get("left_ankle")
+    right_ankle = mapped.get("right_ankle")
+    if left_ankle and left_ankle[2] >= min_confidence and right_ankle and right_ankle[2] >= min_confidence:
+        cv2.line(frame, (left_ankle[0], left_ankle[1]), (right_ankle[0], right_ankle[1]), color, 2)
+        cv2.circle(frame, (left_ankle[0], left_ankle[1]), 4, color, -1)
+        cv2.circle(frame, (right_ankle[0], right_ankle[1]), 4, color, -1)
+    elif left_ankle and left_ankle[2] >= min_confidence:
+        cv2.circle(frame, (left_ankle[0], left_ankle[1]), 4, color, -1)
+    elif right_ankle and right_ankle[2] >= min_confidence:
+        cv2.circle(frame, (right_ankle[0], right_ankle[1]), 4, color, -1)
+    if com:
+        cv2.circle(frame, com, 6, (0, 255, 0), -1)
+        cv2.putText(
+            frame,
+            "COM",
+            (com[0] + 6, com[1] - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def _count_joints_above(normalized: list[dict[str, float | str]], min_confidence: float) -> int:
+    return sum(1 for kp in normalized if float(kp.get("c", 0.0)) >= min_confidence)
+
+
+def _average_confidence(normalized: list[dict[str, float | str]]) -> float:
+    confidences = [float(kp.get("c", 0.0)) for kp in normalized]
+    return sum(confidences) / len(confidences) if confidences else 0.0
+
+
+def _score_primary_candidate(
+    joints_above: int,
+    avg_conf: float,
+    bbox_area: float,
+    continuity: float,
+) -> float:
+    return joints_above * 3.0 + avg_conf * 5.0 + bbox_area * 0.001 + continuity * 0.1
+
+
+def _similar_bbox(area_a: float | None, area_b: float | None) -> bool:
+    if not area_a or not area_b:
+        return False
+    ratio = area_a / area_b if area_b > 0 else 0.0
+    return 0.6 <= ratio <= 1.4
 def _draw_watermark(frame, frame_index: int, fps: float) -> None:
     if cv2 is None:
         return
@@ -1127,10 +1194,11 @@ def export_overlay_video(
     smoothing_alpha: float = 0.7,
     smoothing_enabled: bool = True,
     min_keypoint_confidence: float = 0.1,
-    render_mode: str = "skeleton",
+    overlay_mode: str = "skeleton",
     max_tracks: int = 3,
     track_sort: str = "confidence",
     live_preview: bool = True,
+    draw_bboxes: bool = False,
     cancel_event: object | None = None,
     status_callback: StatusCallback | None = None,
     info_callback: InfoCallback | None = None,
@@ -1198,7 +1266,76 @@ def export_overlay_video(
     frames_with_multiple = 0
     start_time = time.time()
     _update_info(info_callback, {"stage": "Rendering overlay"})
-    primary_track_id = _select_primary_track(valid_tracks, width, height)
+    primary_track_id = None
+    smoothing_alpha = min(max(smoothing_alpha, 0.0), 1.0)
+    smoothed_cache: dict[str, dict[str, tuple[float, float, float]]] = {}
+    logged_keypoints = False
+    logged_mapping_warning = False
+    overlay_mode_normalized = overlay_mode.strip().lower()
+    mode_debug = "debug" in overlay_mode_normalized
+    mode_balance = "balance" in overlay_mode_normalized
+    mode_joints = "joints" in overlay_mode_normalized or "dots" in overlay_mode_normalized
+    mode_skeleton = "skeleton" in overlay_mode_normalized or "lines" in overlay_mode_normalized
+    draw_lines = mode_skeleton or mode_debug
+    draw_joints = mode_skeleton or mode_joints or mode_debug
+    draw_balance = mode_balance
+    show_labels = mode_debug
+    show_debug_regions = mode_debug
+    draw_bboxes = draw_bboxes or mode_debug
+    if mode_debug:
+        logging.info("Debug overlay enabled: capture a screenshot to validate mapping primitives.")
+
+    max_tracks = max(1, min(int(max_tracks), 50))
+    track_stats: dict[str, dict[str, float]] = {}
+    for track in valid_tracks:
+        track_id = str(track.get("track_id", ""))
+        frames = track.get("frames", [])
+        if not isinstance(frames, list) or not frames:
+            continue
+        joints_above_total = 0.0
+        avg_conf_total = 0.0
+        bbox_area_total = 0.0
+        frame_count = 0.0
+        transform = track_transforms.get(track_id)
+        for frame in frames:
+            keypoints = frame.get("keypoints_2d", [])
+            try:
+                keypoint_info = _inspect_keypoints(keypoints)
+                _, layout_names, _ = _resolve_keypoint_layout(keypoint_info)
+                normalized = _normalize_keypoints(keypoints, layout_names)
+            except ValueError:
+                continue
+            joints_above_total += _count_joints_above(normalized, min_keypoint_confidence)
+            avg_conf_total += _average_confidence(normalized)
+            bbox = frame.get("bbox_xywh")
+            if bbox is not None and transform is not None:
+                converted = _convert_bbox(bbox, transform)
+                if converted:
+                    _, _, w, h = converted
+                    bbox_area_total += max(0.0, float(w) * float(h))
+            frame_count += 1.0
+        if frame_count <= 0:
+            continue
+        track_stats[track_id] = {
+            "avg_joints_above": joints_above_total / frame_count,
+            "avg_conf": avg_conf_total / frame_count,
+            "avg_area": bbox_area_total / frame_count,
+            "continuity": float(len(frames)),
+        }
+
+    if track_stats:
+        best_score = None
+        for track_id, stats in track_stats.items():
+            score = _score_primary_candidate(
+                stats.get("avg_joints_above", 0.0),
+                stats.get("avg_conf", 0.0),
+                stats.get("avg_area", 0.0),
+                stats.get("continuity", 0.0),
+            )
+            if best_score is None or score > best_score:
+                best_score = score
+                primary_track_id = track_id
+
     debug_transform = None
     if primary_track_id and primary_track_id in track_transforms:
         debug_transform = track_transforms[primary_track_id]
@@ -1230,38 +1367,29 @@ def export_overlay_video(
             width,
             height,
         )
-    smoothing_alpha = min(max(smoothing_alpha, 0.0), 1.0)
-    smoothed_cache: dict[str, dict[str, tuple[float, float, float]]] = {}
-    logged_keypoints = False
-    logged_mapping_warning = False
-    if debug_overlay:
-        logging.info("Debug overlay enabled: capture a screenshot to validate mapping primitives.")
-    normalized_mode = render_mode.strip().lower()
-    draw_lines = normalized_mode in {"skeleton", "lines+dots", "lines", "skeleton (lines+dots)"}
+
     ranked_tracks: list[str] = []
     if draw_all_tracks:
         scored: list[tuple[float, str]] = []
-        for track in valid_tracks:
-            frames = track.get("frames", [])
-            if not isinstance(frames, list):
-                continue
-            if track_sort == "continuity":
-                score = _track_continuity(frames)
-            else:
-                score = _average_track_confidence(frames)
-            scored.append((score, str(track.get("track_id", ""))))
+        for track_id, stats in track_stats.items():
+            score = _score_primary_candidate(
+                stats.get("avg_joints_above", 0.0),
+                stats.get("avg_conf", 0.0),
+                stats.get("avg_area", 0.0),
+                stats.get("continuity", 0.0),
+            )
+            scored.append((score, track_id))
         scored.sort(key=lambda item: item[0], reverse=True)
         ranked_tracks = [track_id for _, track_id in scored]
+
     allowed_track_ids: set[str] = set()
-    if draw_all_tracks and ranked_tracks:
-        limit = max_tracks if max_tracks > 0 else len(ranked_tracks)
-        allowed_track_ids = set(ranked_tracks[:limit])
-        if primary_track_id:
-            allowed_track_ids.add(primary_track_id)
-    elif primary_track_id:
-        allowed_track_ids = {primary_track_id}
+    sticky_gap = 10
+    last_primary_id: str | None = primary_track_id
+    last_primary_seen = -1
+    last_primary_com: tuple[int, int] | None = None
+    last_primary_area: float | None = None
     last_preview_time = 0.0
-    preview_interval_s = 0.12
+    preview_interval_s = 0.15
     while True:
         if cancel_event is not None and getattr(cancel_event, "is_set")():
             cap.release()
@@ -1278,20 +1406,16 @@ def export_overlay_video(
         if pose_count >= 2:
             frames_with_multiple += 1
         _draw_watermark(annotated, frame_index, fps)
-        if debug_overlay:
+        if show_debug_regions:
             _draw_debug_regions(annotated, debug_transform, width, height)
             _draw_debug_corners(annotated, width, height)
         if not frame_entries:
             _draw_no_pose(annotated)
         else:
             colors = [(0, 200, 255), (255, 200, 0), (180, 255, 120), (255, 120, 180)]
-            diagnostic_frame = frame_index == 0 and primary_track_id is not None
-            for idx, entry in enumerate(frame_entries):
+            frame_candidates: list[dict[str, object]] = []
+            for entry in frame_entries:
                 track_id = str(entry.get("track_id", "track"))
-                if diagnostic_frame and track_id != primary_track_id:
-                    continue
-                if allowed_track_ids and track_id not in allowed_track_ids:
-                    continue
                 transform = track_transforms.get(track_id)
                 if transform is None:
                     continue
@@ -1306,9 +1430,6 @@ def export_overlay_video(
                     warned_frame_sync.add(track_id)
                 bbox = entry.get("bbox_xywh")
                 converted_bbox = _convert_bbox(bbox, transform) if bbox is not None else None
-                color = colors[idx % len(colors)]
-                if converted_bbox:
-                    _draw_bbox(annotated, converted_bbox, color)
                 keypoints = entry.get("keypoints_2d", [])
                 try:
                     mapped, keypoint_info, layout_name, skeleton, normalized = _convert_keypoints(keypoints, transform)
@@ -1337,9 +1458,7 @@ def export_overlay_video(
                         _record_problem(info_callback, "MAPPING_BROKEN", message)
                         _update_info(info_callback, {"mapping_warning": True})
                         logged_mapping_warning = True
-                if debug_overlay:
-                    _draw_keypoint_labels(annotated, mapped, color)
-                if not logged_keypoints and diagnostic_frame:
+                if not logged_keypoints and frame_index == 0:
                     raw_samples = []
                     for idx, kp in enumerate(normalized[:3]):
                         name = kp.get("name", f"k{idx}")
@@ -1366,6 +1485,105 @@ def export_overlay_video(
                         raw_samples,
                     )
                     logged_keypoints = True
+                joints_above = _count_joints_above(normalized, min_keypoint_confidence)
+                avg_conf = _average_confidence(normalized)
+                bbox_area = 0.0
+                if converted_bbox:
+                    _, _, w, h = converted_bbox
+                    bbox_area = max(0.0, float(w) * float(h))
+                frame_candidates.append(
+                    {
+                        "track_id": track_id,
+                        "mapped": mapped,
+                        "layout_name": layout_name,
+                        "skeleton": skeleton,
+                        "normalized": normalized,
+                        "bbox": converted_bbox,
+                        "joints_above": joints_above,
+                        "avg_conf": avg_conf,
+                        "bbox_area": bbox_area,
+                        "com": _center_of_mass(mapped, min_keypoint_confidence),
+                    }
+                )
+
+            current_primary_id = None
+            current_primary_com: tuple[int, int] | None = None
+            current_primary_area: float | None = None
+            if last_primary_id:
+                match = next(
+                    (candidate for candidate in frame_candidates if candidate["track_id"] == last_primary_id),
+                    None,
+                )
+                if match:
+                    current_primary_id = last_primary_id
+                    current_primary_com = match.get("com")
+                    current_primary_area = float(match.get("bbox_area", 0.0) or 0.0)
+            if (
+                current_primary_id is None
+                and last_primary_id
+                and last_primary_seen >= 0
+                and frame_index - last_primary_seen <= sticky_gap
+                and last_primary_com
+            ):
+                nearest = None
+                nearest_dist = None
+                for candidate in frame_candidates:
+                    candidate_com = candidate.get("com")
+                    candidate_area = float(candidate.get("bbox_area", 0.0) or 0.0)
+                    if candidate_com is None or not _similar_bbox(last_primary_area, candidate_area):
+                        continue
+                    dist = math.hypot(candidate_com[0] - last_primary_com[0], candidate_com[1] - last_primary_com[1])
+                    if nearest_dist is None or dist < nearest_dist:
+                        nearest_dist = dist
+                        nearest = candidate
+                if nearest:
+                    current_primary_id = str(nearest.get("track_id", ""))
+                    current_primary_com = nearest.get("com")
+                    current_primary_area = float(nearest.get("bbox_area", 0.0) or 0.0)
+            if current_primary_id is None and frame_candidates:
+                best_score = None
+                best_candidate = None
+                for candidate in frame_candidates:
+                    track_id = str(candidate.get("track_id", ""))
+                    stats = track_stats.get(track_id, {})
+                    score = _score_primary_candidate(
+                        float(candidate.get("joints_above", 0.0)),
+                        float(candidate.get("avg_conf", 0.0)),
+                        float(candidate.get("bbox_area", 0.0)),
+                        float(stats.get("continuity", 0.0)),
+                    )
+                    if best_score is None or score > best_score:
+                        best_score = score
+                        best_candidate = candidate
+                if best_candidate:
+                    current_primary_id = str(best_candidate.get("track_id", ""))
+                    current_primary_com = best_candidate.get("com")
+                    current_primary_area = float(best_candidate.get("bbox_area", 0.0) or 0.0)
+
+            if current_primary_id:
+                last_primary_id = current_primary_id
+                last_primary_seen = frame_index
+                last_primary_com = current_primary_com
+                last_primary_area = current_primary_area
+
+            if draw_all_tracks and ranked_tracks:
+                limit = max_tracks if max_tracks > 0 else len(ranked_tracks)
+                allowed_track_ids = set(ranked_tracks[:limit])
+                if current_primary_id:
+                    allowed_track_ids.add(current_primary_id)
+            elif current_primary_id:
+                allowed_track_ids = {current_primary_id}
+            else:
+                allowed_track_ids = set()
+
+            for idx, candidate in enumerate(frame_candidates):
+                track_id = str(candidate.get("track_id", "track"))
+                if allowed_track_ids and track_id not in allowed_track_ids:
+                    continue
+                color = colors[idx % len(colors)]
+                mapped = candidate["mapped"]
+                layout_name = candidate["layout_name"]
+                skeleton = candidate["skeleton"]
                 smoothed_track = smoothed_cache.setdefault(track_id, {})
                 smoothed_mapped: dict[str, tuple[int, int, float]] = {}
                 if smoothing_enabled:
@@ -1384,16 +1602,16 @@ def export_overlay_video(
                         if conf < min_keypoint_confidence:
                             continue
                         smoothed_mapped[name] = (int(round(x)), int(round(y)), conf)
-                if diagnostic_frame:
-                    _draw_pose_overlay(
-                        annotated,
-                        mapped,
-                        color,
-                        skeleton,
-                        min_keypoint_confidence,
-                        draw_lines=False,
-                    )
-                else:
+
+                if draw_bboxes:
+                    bbox = candidate.get("bbox")
+                    if bbox:
+                        _draw_bbox(annotated, bbox, color)
+                if show_labels:
+                    _draw_keypoint_labels(annotated, mapped, color)
+                if draw_balance:
+                    _draw_balance_overlay(annotated, smoothed_mapped, min_keypoint_confidence, color)
+                if draw_joints:
                     _draw_pose_overlay(
                         annotated,
                         smoothed_mapped,
@@ -1528,26 +1746,48 @@ def run_pipeline(
         pose_path = output_dir / "pose_tracks.json"
 
     if video_path and options.export_overlay_video:
-        export_overlay_video(
-            video_path,
-            output_dir / "overlay.mp4",
-            payload["tracks"],
-            float(payload["video"]["fps"]),
-            int(payload["video"]["width"]),
-            int(payload["video"]["height"]),
-            debug_overlay=options.debug_overlay,
-            draw_all_tracks=options.draw_all_tracks,
-            smoothing_alpha=options.smoothing_alpha,
-            smoothing_enabled=options.smoothing_enabled,
-            min_keypoint_confidence=options.min_keypoint_confidence,
-            render_mode=options.render_mode,
-            max_tracks=options.max_tracks,
-            track_sort=options.track_sort,
-            live_preview=options.live_preview,
-            cancel_event=cancel_event,
-            status_callback=status_callback,
-            info_callback=info_callback,
-        )
+        overlay_variants = [
+            ("overlay_skeleton.mp4", "skeleton", False),
+            ("overlay_joints.mp4", "joints", False),
+            ("overlay_balance.mp4", "balance", False),
+        ]
+        if options.debug_overlay:
+            overlay_variants.append(("overlay_debug.mp4", "debug", True))
+        preview_mode = options.overlay_mode
+        known_modes = {variant[1] for variant in overlay_variants}
+        if preview_mode not in known_modes:
+            preview_mode = "skeleton"
+        for filename, mode, draw_bboxes in overlay_variants:
+            export_overlay_video(
+                video_path,
+                output_dir / filename,
+                payload["tracks"],
+                float(payload["video"]["fps"]),
+                int(payload["video"]["width"]),
+                int(payload["video"]["height"]),
+                debug_overlay=options.debug_overlay,
+                draw_all_tracks=options.draw_all_tracks,
+                smoothing_alpha=options.smoothing_alpha,
+                smoothing_enabled=options.smoothing_enabled,
+                min_keypoint_confidence=options.min_keypoint_confidence,
+                overlay_mode=mode,
+                max_tracks=options.max_tracks,
+                track_sort=options.track_sort,
+                live_preview=options.live_preview and mode == preview_mode,
+                draw_bboxes=draw_bboxes,
+                cancel_event=cancel_event,
+                status_callback=status_callback,
+                info_callback=info_callback,
+            )
+        skeleton_path = output_dir / "overlay_skeleton.mp4"
+        legacy_path = output_dir / "overlay.mp4"
+        if skeleton_path.exists():
+            try:
+                import shutil
+
+                shutil.copy2(skeleton_path, legacy_path)
+            except OSError as exc:
+                logging.warning("Failed to write legacy overlay.mp4: %s", exc)
 
     if video_path and options.save_thumbnails:
         save_thumbnails(video_path, output_dir / "thumbnails", cancel_event, status_callback)
@@ -1561,8 +1801,10 @@ def run_pipeline(
         summary = (
             f"Tracks={results['tracks']['count']} "
             f"AvgLen={results['tracks']['avg_track_length']:.1f} "
-            f"OOB={results['keypoints']['out_of_bounds_pct']:.1f}% "
-            f"Conf={results['keypoints']['avg_confidence']:.2f}"
+            f"Frames>=1={results['frames']['with_pose']}/{results['frames']['total']} "
+            f"Frames>=2={results['frames']['with_multiple']}/{results['frames']['total']} "
+            f"Conf={results['keypoints']['avg_confidence']:.2f} "
+            f"COMJitter={results['jitter']['center_of_mass_avg_px']:.1f}px"
         )
         _update_info(
             info_callback,
@@ -1570,8 +1812,20 @@ def run_pipeline(
                 "evaluation_summary": summary,
                 "evaluation_json": str(json_path),
                 "evaluation_text": str(text_path),
+                "evaluation_stats": results,
             },
         )
+        pose_ratio = float(results.get("frames", {}).get("pose_ratio", 0.0) or 0.0)
+        if pose_ratio < 0.4:
+            _update_info(
+                info_callback,
+                {
+                    "evaluation_warning": (
+                        "Low pose coverage detected. Try lowering the confidence threshold "
+                        "or enable diagnostic mode for troubleshooting."
+                    )
+                },
+            )
 
     _update_status(status_callback, "Done.", 100)
     _update_info(info_callback, {"stage": "Done"})
