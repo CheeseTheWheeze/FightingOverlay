@@ -29,7 +29,13 @@ class ProcessingOptions:
     debug_overlay: bool = False
     draw_all_tracks: bool = False
     smoothing_alpha: float = 0.7
-    min_keypoint_confidence: float = 0.2
+    smoothing_enabled: bool = True
+    min_keypoint_confidence: float = 0.3
+    render_mode: str = "skeleton"
+    max_tracks: int = 3
+    track_sort: str = "confidence"
+    live_preview: bool = True
+    run_evaluation: bool = False
     tracking_backend: str = "Motion (fast)"
     manual_track_ids: list[str] | None = None
 
@@ -50,6 +56,19 @@ def _update_status(callback: StatusCallback | None, message: str, progress: floa
 def _update_info(callback: InfoCallback | None, info: dict[str, object]) -> None:
     if callback:
         callback(info)
+
+
+def _record_problem(callback: InfoCallback | None, code: str, message: str) -> None:
+    logging.warning("%s: %s", code, message)
+    _update_info(
+        callback,
+        {
+            "problem": {
+                "code": code,
+                "message": message,
+            }
+        },
+    )
 
 
 def load_video_metadata(video_path: Path | None) -> dict[str, float | int | str]:
@@ -308,6 +327,15 @@ def _score_track(frames: list[dict[str, object]]) -> float:
         motion += math.hypot(dx, dy)
     motion_energy = motion / max(1, len(centers) - 1)
     return avg_area * (1 + motion_energy / 100)
+
+
+def _average_track_confidence(frames: list[dict[str, object]]) -> float:
+    confidences = [float(frame.get("confidence", 0.0)) for frame in frames if frame.get("confidence") is not None]
+    return sum(confidences) / len(confidences) if confidences else 0.0
+
+
+def _track_continuity(frames: list[dict[str, object]]) -> float:
+    return float(len(frames))
 
 
 def select_foreground_tracks(
@@ -672,35 +700,53 @@ def _normalize_keypoints(
     raise ValueError("Unsupported keypoint format.")
 
 
+_REQUIRED_SOURCE_FIELDS = (
+    "coord_space",
+    "transform_kind",
+    "infer_width",
+    "infer_height",
+    "resized_width",
+    "resized_height",
+    "pad_left",
+    "pad_right",
+    "pad_top",
+    "pad_bottom",
+    "crop_x",
+    "crop_y",
+    "crop_w",
+    "crop_h",
+)
+
+
 def _build_transform(
     track: dict[str, object],
     frame_width: int,
     frame_height: int,
+    info_callback: InfoCallback | None = None,
 ) -> dict[str, float | str]:
     source = track.get("source", {})
     if not isinstance(source, dict):
         source = {}
-    coord_space = str(source.get("coord_space", "pixels_in_original"))
-    transform_kind = str(source.get("transform_kind", "NONE")).upper()
-    infer_w = int(source.get("infer_width", source.get("input_width", frame_width)) or frame_width)
-    infer_h = int(source.get("infer_height", source.get("input_height", frame_height)) or frame_height)
-    resized_w = source.get("resized_width")
-    resized_h = source.get("resized_height")
-    if resized_w is None or resized_h is None:
-        logging.warning(
-            "Missing resized dimensions in track source; falling back to infer size. "
-            "Please store resized_width/resized_height at preprocess time."
-        )
-    resized_w = int(resized_w or infer_w)
-    resized_h = int(resized_h or infer_h)
-    pad_left = float(source.get("pad_left", source.get("pad_x", 0.0)))
-    pad_right = float(source.get("pad_right", source.get("pad_x", 0.0)))
-    pad_top = float(source.get("pad_top", source.get("pad_y", 0.0)))
-    pad_bottom = float(source.get("pad_bottom", source.get("pad_y", 0.0)))
-    crop_x = float(source.get("crop_x", 0.0))
-    crop_y = float(source.get("crop_y", 0.0))
-    crop_w = float(source.get("crop_w", frame_width))
-    crop_h = float(source.get("crop_h", frame_height))
+    track_id = str(track.get("track_id", "unknown"))
+    missing = [field for field in _REQUIRED_SOURCE_FIELDS if source.get(field) is None]
+    if missing:
+        message = f"Track {track_id} missing required mapping metadata: {', '.join(missing)}"
+        _record_problem(info_callback, "MAPPING_METADATA_INCOMPLETE", message)
+        raise ValueError(message)
+    coord_space = str(source["coord_space"])
+    transform_kind = str(source["transform_kind"]).upper()
+    infer_w = int(source["infer_width"] or frame_width)
+    infer_h = int(source["infer_height"] or frame_height)
+    resized_w = int(source["resized_width"] or infer_w)
+    resized_h = int(source["resized_height"] or infer_h)
+    pad_left = float(source["pad_left"])
+    pad_right = float(source["pad_right"])
+    pad_top = float(source["pad_top"])
+    pad_bottom = float(source["pad_bottom"])
+    crop_x = float(source["crop_x"])
+    crop_y = float(source["crop_y"])
+    crop_w = float(source["crop_w"])
+    crop_h = float(source["crop_h"])
     if transform_kind == "LETTERBOX":
         inferred_w = pad_left + float(resized_w) + pad_right
         inferred_h = pad_top + float(resized_h) + pad_bottom
@@ -855,7 +901,10 @@ def _select_primary_track(
     center_y = frame_height / 2.0
     candidates: list[tuple[float, float, str]] = []
     for track in tracks:
-        transform = _build_transform(track, frame_width, frame_height)
+        try:
+            transform = _build_transform(track, frame_width, frame_height)
+        except ValueError:
+            continue
         frames = track.get("frames", [])
         if not isinstance(frames, list):
             continue
@@ -1076,7 +1125,12 @@ def export_overlay_video(
     debug_overlay: bool = True,
     draw_all_tracks: bool = False,
     smoothing_alpha: float = 0.7,
+    smoothing_enabled: bool = True,
     min_keypoint_confidence: float = 0.1,
+    render_mode: str = "skeleton",
+    max_tracks: int = 3,
+    track_sort: str = "confidence",
+    live_preview: bool = True,
     cancel_event: object | None = None,
     status_callback: StatusCallback | None = None,
     info_callback: InfoCallback | None = None,
@@ -1095,10 +1149,15 @@ def export_overlay_video(
     frame_map: dict[int, list[dict[str, object]]] = {}
     track_transforms: dict[str, dict[str, float | str]] = {}
     warned_frame_sync: set[str] = set()
+    valid_tracks: list[dict[str, object]] = []
     for track in tracks:
         track_id = str(track.get("track_id", "unknown"))
-        transform = _build_transform(track, width, height)
+        try:
+            transform = _build_transform(track, width, height, info_callback)
+        except ValueError:
+            continue
         track_transforms[track_id] = transform
+        valid_tracks.append(track)
         logging.info(
             (
                 "Overlay mapping track=%s orig=(%s,%s) infer=(%s,%s) resized=(%s,%s) "
@@ -1139,20 +1198,70 @@ def export_overlay_video(
     frames_with_multiple = 0
     start_time = time.time()
     _update_info(info_callback, {"stage": "Rendering overlay"})
-    primary_track_id = _select_primary_track(tracks, width, height)
+    primary_track_id = _select_primary_track(valid_tracks, width, height)
     debug_transform = None
     if primary_track_id and primary_track_id in track_transforms:
         debug_transform = track_transforms[primary_track_id]
     elif track_transforms:
         debug_transform = next(iter(track_transforms.values()))
     else:
-        debug_transform = _build_transform({"source": {}}, width, height)
+        message = "No valid tracks available for overlay (missing mapping metadata)."
+        _record_problem(info_callback, "MAPPING_METADATA_INCOMPLETE", message)
+        debug_transform = _build_transform(
+            {
+                "track_id": "debug",
+                "source": {
+                    "coord_space": "pixels_in_original",
+                    "transform_kind": "NONE",
+                    "infer_width": width,
+                    "infer_height": height,
+                    "resized_width": width,
+                    "resized_height": height,
+                    "pad_left": 0.0,
+                    "pad_right": 0.0,
+                    "pad_top": 0.0,
+                    "pad_bottom": 0.0,
+                    "crop_x": 0.0,
+                    "crop_y": 0.0,
+                    "crop_w": width,
+                    "crop_h": height,
+                },
+            },
+            width,
+            height,
+        )
     smoothing_alpha = min(max(smoothing_alpha, 0.0), 1.0)
     smoothed_cache: dict[str, dict[str, tuple[float, float, float]]] = {}
     logged_keypoints = False
     logged_mapping_warning = False
     if debug_overlay:
         logging.info("Debug overlay enabled: capture a screenshot to validate mapping primitives.")
+    normalized_mode = render_mode.strip().lower()
+    draw_lines = normalized_mode in {"skeleton", "lines+dots", "lines", "skeleton (lines+dots)"}
+    ranked_tracks: list[str] = []
+    if draw_all_tracks:
+        scored: list[tuple[float, str]] = []
+        for track in valid_tracks:
+            frames = track.get("frames", [])
+            if not isinstance(frames, list):
+                continue
+            if track_sort == "continuity":
+                score = _track_continuity(frames)
+            else:
+                score = _average_track_confidence(frames)
+            scored.append((score, str(track.get("track_id", ""))))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        ranked_tracks = [track_id for _, track_id in scored]
+    allowed_track_ids: set[str] = set()
+    if draw_all_tracks and ranked_tracks:
+        limit = max_tracks if max_tracks > 0 else len(ranked_tracks)
+        allowed_track_ids = set(ranked_tracks[:limit])
+        if primary_track_id:
+            allowed_track_ids.add(primary_track_id)
+    elif primary_track_id:
+        allowed_track_ids = {primary_track_id}
+    last_preview_time = 0.0
+    preview_interval_s = 0.12
     while True:
         if cancel_event is not None and getattr(cancel_event, "is_set")():
             cap.release()
@@ -1181,38 +1290,38 @@ def export_overlay_video(
                 track_id = str(entry.get("track_id", "track"))
                 if diagnostic_frame and track_id != primary_track_id:
                     continue
-                transform = track_transforms.get(track_id, _build_transform({"source": {}}, width, height))
+                if allowed_track_ids and track_id not in allowed_track_ids:
+                    continue
+                transform = track_transforms.get(track_id)
+                if transform is None:
+                    continue
                 timestamp_ms = float(entry.get("timestamp_ms", 0.0))
                 expected_ts = frame_index / max(1.0, fps) * 1000.0
                 if track_id not in warned_frame_sync and abs(timestamp_ms - expected_ts) > (1000.0 / max(1.0, fps)) * 1.5:
-                    logging.warning(
-                        "Frame sync mismatch track=%s frame=%s timestamp_ms=%.1f expected=%.1f",
-                        track_id,
-                        frame_index,
-                        timestamp_ms,
-                        expected_ts,
+                    message = (
+                        f"Frame sync mismatch track={track_id} frame={frame_index} "
+                        f"timestamp_ms={timestamp_ms:.1f} expected={expected_ts:.1f}"
                     )
+                    _record_problem(info_callback, "FRAME_SYNC_DRIFT", message)
                     warned_frame_sync.add(track_id)
                 bbox = entry.get("bbox_xywh")
                 converted_bbox = _convert_bbox(bbox, transform) if bbox is not None else None
                 color = colors[idx % len(colors)]
                 if converted_bbox:
                     _draw_bbox(annotated, converted_bbox, color)
-                if not draw_all_tracks and primary_track_id and track_id != primary_track_id:
-                    continue
                 keypoints = entry.get("keypoints_2d", [])
                 try:
                     mapped, keypoint_info, layout_name, skeleton, normalized = _convert_keypoints(keypoints, transform)
                 except ValueError as exc:
-                    logging.warning("Skipping invalid keypoints for track %s: %s", track_id, exc)
+                    _record_problem(info_callback, "KEYPOINT_SHAPE_MISMATCH", f"Track {track_id}: {exc}")
                     continue
                 if layout_name is None and not logged_keypoints:
-                    logging.warning(
-                        "Unknown keypoint layout K=%s shape=%s stride=%s; drawing dots only.",
-                        keypoint_info.get("count"),
-                        keypoint_info.get("shape"),
-                        keypoint_info.get("stride"),
+                    message = (
+                        "Unknown keypoint layout "
+                        f"K={keypoint_info.get('count')} shape={keypoint_info.get('shape')} "
+                        f"stride={keypoint_info.get('stride')}; drawing dots only."
                     )
+                    _record_problem(info_callback, "KEYPOINT_LAYOUT_UNKNOWN", message)
                 if mapped:
                     total_kps = len(mapped)
                     out_of_bounds = sum(
@@ -1221,13 +1330,11 @@ def export_overlay_video(
                         if x < 0 or y < 0 or x >= width or y >= height
                     )
                     if total_kps > 0 and out_of_bounds / total_kps >= 0.6 and not logged_mapping_warning:
-                        logging.warning(
-                            "MAPPING BROKEN: %s/%s keypoints out of bounds on frame %s (track=%s)",
-                            out_of_bounds,
-                            total_kps,
-                            frame_index,
-                            track_id,
+                        message = (
+                            f"MAPPING BROKEN: {out_of_bounds}/{total_kps} keypoints out of bounds "
+                            f"on frame {frame_index} (track={track_id})"
                         )
+                        _record_problem(info_callback, "MAPPING_BROKEN", message)
                         _update_info(info_callback, {"mapping_warning": True})
                         logged_mapping_warning = True
                 if debug_overlay:
@@ -1261,16 +1368,22 @@ def export_overlay_video(
                     logged_keypoints = True
                 smoothed_track = smoothed_cache.setdefault(track_id, {})
                 smoothed_mapped: dict[str, tuple[int, int, float]] = {}
-                for name, (x, y, conf) in mapped.items():
-                    if conf < min_keypoint_confidence:
-                        continue
-                    if name in smoothed_track:
-                        prev_x, prev_y, prev_c = smoothed_track[name]
-                        x = smoothing_alpha * x + (1 - smoothing_alpha) * prev_x
-                        y = smoothing_alpha * y + (1 - smoothing_alpha) * prev_y
-                        conf = smoothing_alpha * conf + (1 - smoothing_alpha) * prev_c
-                    smoothed_track[name] = (x, y, conf)
-                    smoothed_mapped[name] = (int(round(x)), int(round(y)), conf)
+                if smoothing_enabled:
+                    for name, (x, y, conf) in mapped.items():
+                        if conf < min_keypoint_confidence:
+                            continue
+                        if name in smoothed_track:
+                            prev_x, prev_y, prev_c = smoothed_track[name]
+                            x = smoothing_alpha * x + (1 - smoothing_alpha) * prev_x
+                            y = smoothing_alpha * y + (1 - smoothing_alpha) * prev_y
+                            conf = smoothing_alpha * conf + (1 - smoothing_alpha) * prev_c
+                        smoothed_track[name] = (x, y, conf)
+                        smoothed_mapped[name] = (int(round(x)), int(round(y)), conf)
+                else:
+                    for name, (x, y, conf) in mapped.items():
+                        if conf < min_keypoint_confidence:
+                            continue
+                        smoothed_mapped[name] = (int(round(x)), int(round(y)), conf)
                 if diagnostic_frame:
                     _draw_pose_overlay(
                         annotated,
@@ -1287,7 +1400,7 @@ def export_overlay_video(
                         color,
                         skeleton,
                         min_keypoint_confidence,
-                        draw_lines=layout_name is not None,
+                        draw_lines=layout_name is not None and draw_lines,
                     )
                 label_x, label_y = _select_label_position(smoothed_mapped)
                 cv2.putText(
@@ -1300,6 +1413,29 @@ def export_overlay_video(
                     1,
                     cv2.LINE_AA,
                 )
+        if live_preview and info_callback is not None:
+            now = time.time()
+            if now - last_preview_time >= preview_interval_s:
+                preview_frame = annotated
+                max_width = 640
+                if width > max_width:
+                    scale = max_width / float(width)
+                    preview_frame = cv2.resize(
+                        preview_frame,
+                        (int(round(width * scale)), int(round(height * scale))),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                ok, buffer = cv2.imencode(".png", preview_frame)
+                if ok:
+                    _update_info(
+                        info_callback,
+                        {
+                            "preview_image": buffer.tobytes(),
+                            "preview_frame_index": frame_index + 1,
+                            "preview_total_frames": total,
+                        },
+                    )
+                last_preview_time = now
         writer.write(annotated)
         frame_index += 1
         if frame_index % 5 == 0 or frame_index == total:
@@ -1402,7 +1538,12 @@ def run_pipeline(
             debug_overlay=options.debug_overlay,
             draw_all_tracks=options.draw_all_tracks,
             smoothing_alpha=options.smoothing_alpha,
+            smoothing_enabled=options.smoothing_enabled,
             min_keypoint_confidence=options.min_keypoint_confidence,
+            render_mode=options.render_mode,
+            max_tracks=options.max_tracks,
+            track_sort=options.track_sort,
+            live_preview=options.live_preview,
             cancel_event=cancel_event,
             status_callback=status_callback,
             info_callback=info_callback,
@@ -1410,6 +1551,27 @@ def run_pipeline(
 
     if video_path and options.save_thumbnails:
         save_thumbnails(video_path, output_dir / "thumbnails", cancel_event, status_callback)
+
+    if options.run_evaluation:
+        from core.evaluation import write_evaluation_report
+
+        _update_status(status_callback, "Evaluating tracking quality...", 95)
+        _update_info(info_callback, {"stage": "Evaluating tracks"})
+        json_path, text_path, results = write_evaluation_report(payload)
+        summary = (
+            f"Tracks={results['tracks']['count']} "
+            f"AvgLen={results['tracks']['avg_track_length']:.1f} "
+            f"OOB={results['keypoints']['out_of_bounds_pct']:.1f}% "
+            f"Conf={results['keypoints']['avg_confidence']:.2f}"
+        )
+        _update_info(
+            info_callback,
+            {
+                "evaluation_summary": summary,
+                "evaluation_json": str(json_path),
+                "evaluation_text": str(text_path),
+            },
+        )
 
     _update_status(status_callback, "Done.", 100)
     _update_info(info_callback, {"stage": "Done"})
