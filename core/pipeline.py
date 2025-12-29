@@ -25,6 +25,7 @@ class ProcessingOptions:
     export_overlay_video: bool = True
     save_pose_json: bool = True
     save_thumbnails: bool = False
+    save_combat_overlay: bool = False
     save_background_tracks: bool = True
     foreground_mode: str = "Auto (closest/most active)"
     debug_overlay: bool = False
@@ -37,6 +38,7 @@ class ProcessingOptions:
     track_sort: str = "confidence"
     live_preview: bool = True
     run_evaluation: bool = False
+    run_judge: bool = False
     tracking_backend: str = "Motion (fast)"
     manual_track_ids: list[str] | None = None
 
@@ -1593,9 +1595,11 @@ def export_overlay_video(
     mode_balance = "balance" in overlay_mode_normalized
     mode_joints = "joints" in overlay_mode_normalized or "dots" in overlay_mode_normalized
     mode_skeleton = "skeleton" in overlay_mode_normalized or "lines" in overlay_mode_normalized
+    mode_combat = "combat" in overlay_mode_normalized
     draw_lines = mode_skeleton or (mode_debug and not mode_joints)
     draw_joints = mode_skeleton or mode_joints or mode_debug
     draw_balance = mode_balance
+    draw_combat = mode_combat
     show_labels = mode_debug
     show_joint_indices = mode_debug or mode_joints
     show_debug_regions = mode_debug
@@ -2011,6 +2015,16 @@ def export_overlay_video(
                         min_keypoint_confidence,
                         draw_lines=layout_name is not None and draw_lines and com_matches,
                     )
+                if draw_combat:
+                    from fightai.combat.derive import _derive_from_points
+                    from fightai.combat.render import render_combat_overlay
+
+                    combat_input = {
+                        name: {"name": name, "x": x, "y": y, "c": c}
+                        for name, (x, y, c) in smoothed_mapped.items()
+                    }
+                    derived = _derive_from_points(combat_input)
+                    render_combat_overlay(annotated, derived["points"], derived["zones"])
                 label_x, label_y = _select_label_position(smoothed_mapped)
                 cv2.putText(
                     annotated,
@@ -2149,11 +2163,20 @@ def run_pipeline(
     else:
         pose_path = output_dir / "pose_tracks.json"
 
+    if options.save_combat_overlay:
+        from fightai.combat.derive import derive_combat_overlay
+
+        _update_status(status_callback, "Deriving combat overlay...", 82)
+        combat_path = output_dir / "combat_overlay.json"
+        derive_combat_overlay(payload, combat_path)
+        _update_info(info_callback, {"combat_overlay_json": str(combat_path)})
+
     if video_path and options.export_overlay_video:
         overlay_variants = [
             ("overlay_skeleton.mp4", "skeleton", False),
             ("overlay_joints.mp4", "joints", False),
             ("overlay_balance.mp4", "balance", False),
+            ("overlay_combat.mp4", "combat", False),
         ]
         if options.debug_overlay:
             overlay_variants.append(("overlay_debug.mp4", "debug", True))
@@ -2231,6 +2254,19 @@ def run_pipeline(
                     )
                 },
             )
+
+    if options.run_judge and video_path:
+        from fightai.judge.runner import run_judge
+
+        _update_status(status_callback, "Running alignment judge...", 97)
+        overlay_path = output_dir / "overlay_skeleton.mp4"
+        judge_output = run_judge(
+            raw_video=video_path,
+            tracks_json=pose_path,
+            output_dir=output_dir,
+            overlay_video=overlay_path if overlay_path.exists() else None,
+        )
+        _update_info(info_callback, {"judge_output": judge_output})
 
     _update_status(status_callback, "Done.", 100)
     _update_info(info_callback, {"stage": "Done"})
