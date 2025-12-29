@@ -5,8 +5,10 @@ import base64
 from collections import deque
 import json
 import logging
+import shutil
 import subprocess
 import threading
+import traceback
 import urllib.error
 import urllib.request
 import webbrowser
@@ -33,11 +35,13 @@ import cv2  # type: ignore
 from core.paths import (
     get_app_root,
     get_bootstrapper_path,
+    get_codex_packets_root,
     get_current_pointer,
     get_last_update_path,
-    get_update_history_path,
     get_log_root,
     get_outputs_root,
+    get_sent_codex_packets_root,
+    get_update_history_path,
 )
 from core.pipeline import ProcessingCancelled, ProcessingOptions, run_pipeline
 from core.settings import load_settings, save_settings
@@ -279,7 +283,11 @@ def get_ui_scale(root: Tk) -> float:
     width = root.winfo_screenwidth()
     height = root.winfo_screenheight()
     scale = min(width / 1280, height / 720)
-    return max(0.85, min(scale, 1.4))
+    return max(0.85, min(scale, 2.5))
+
+
+def get_reference_scale() -> float:
+    return min(1920 / 1280, 1080 / 720)
 
 
 def create_scrollable_tab(parent: ttk.Notebook, theme: dict[str, str]) -> tuple[ttk.Frame, ttk.Frame]:
@@ -355,12 +363,65 @@ def create_scrollable_panel(parent: ttk.Frame, theme: dict[str, str]) -> tuple[t
     return panel, content
 
 
+def bind_mousewheel(widget: object, scroll_target: object | None = None) -> None:
+    target = scroll_target or widget
+
+    def _on_mousewheel(event: object) -> str:
+        delta = getattr(event, "delta", 0)
+        if delta:
+            target.yview_scroll(int(-1 * (delta / 120)), "units")
+        elif getattr(event, "num", 0) == 4:
+            target.yview_scroll(-1, "units")
+        elif getattr(event, "num", 0) == 5:
+            target.yview_scroll(1, "units")
+        return "break"
+
+    widget.bind("<MouseWheel>", _on_mousewheel)
+    widget.bind("<Button-4>", _on_mousewheel)
+    widget.bind("<Button-5>", _on_mousewheel)
+
+
 def format_duration(seconds: float) -> str:
     total = max(0, int(seconds))
     hours = total // 3600
     minutes = (total % 3600) // 60
     secs = total % 60
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def list_packet_paths(root: Path) -> list[Path]:
+    root.mkdir(parents=True, exist_ok=True)
+    return sorted(root.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def load_latest_evaluation_summary(log_root: Path) -> tuple[str | None, Path | None]:
+    candidates = sorted(log_root.glob("evaluation_*.txt"), key=lambda path: path.stat().st_mtime, reverse=True)
+    if not candidates:
+        return None, None
+    latest = candidates[0]
+    return latest.read_text(encoding="utf-8").strip(), latest
+
+
+def load_recent_evaluation_json_paths(log_root: Path, limit: int = 5) -> list[str]:
+    candidates = sorted(log_root.glob("evaluation_*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    return [str(path) for path in candidates[:limit]]
+
+
+def load_debug_pack_manifest(output_root: Path) -> dict[str, object]:
+    report_path = output_root / "debug_pack_report.json"
+    if not report_path.exists():
+        return {"status": "missing", "path": str(report_path)}
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"status": "unreadable", "path": str(report_path)}
+    payload["path"] = str(report_path)
+    return payload
+
+
+def get_latest_debug_pack_dir(output_root: Path) -> Path | None:
+    candidates = sorted(output_root.glob("debug_pack_*"), key=lambda path: path.stat().st_mtime, reverse=True)
+    return candidates[0] if candidates else None
 
 
 def main() -> None:
@@ -397,6 +458,8 @@ def main() -> None:
         "update_channel": "Stable",
         "last_update_check": "",
         "last_selected_tab": "Run / Processing",
+        "ui_scale_multiplier": 1.0,
+        "ui_font_size": 12,
     }
     settings = load_settings(defaults)
     sync_update_history()
@@ -413,10 +476,12 @@ def main() -> None:
         return
 
     root = Tk()
-    scale = get_ui_scale(root)
+    scale = get_ui_scale(root) * float(settings.get("ui_scale_multiplier", 1.0))
+    reference_scale = get_reference_scale()
     root.tk.call("tk", "scaling", scale)
     base_font = tkfont.nametofont("TkDefaultFont")
-    base_font.configure(size=max(9, int(10 * scale)))
+    base_font_size = max(9, int(float(settings.get("ui_font_size", 12)) * (scale / reference_scale)))
+    base_font.configure(size=base_font_size)
     theme = configure_dark_theme(root, scale)
     root.title("FightingOverlay Control Center")
     root.geometry(f"{int(980 * scale)}x{int(720 * scale)}")
@@ -465,6 +530,8 @@ def main() -> None:
     smoothing_alpha_var = DoubleVar(value=float(settings.get("smoothing_alpha") or 0.7))
     min_conf_var = DoubleVar(value=float(settings.get("confidence_threshold") or 0.3))
     tracking_backend_var = StringVar(value=str(settings.get("tracking_backend")))
+    ui_scale_var = DoubleVar(value=float(settings.get("ui_scale_multiplier", 1.0)))
+    ui_font_size_var = IntVar(value=int(settings.get("ui_font_size", 12)))
 
     cancel_event = threading.Event()
 
@@ -473,13 +540,25 @@ def main() -> None:
     if track_sort_var.get() != "Stability score":
         track_sort_var.set("Stability score")
 
+    pending_count_var = StringVar(value="Pending packets: 0")
+    run_state: dict[str, object] = {
+        "evaluation_summary": None,
+        "evaluation_text_path": None,
+        "evaluation_json_path": None,
+        "evaluation_stats": None,
+        "stack_trace": None,
+        "last_error": None,
+        "problems": [],
+        "judge_output": None,
+    }
+
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=1)
 
     container = ttk.Frame(root, padding=16)
     container.grid(row=0, column=0, sticky="nsew")
     container.columnconfigure(0, weight=1)
-    container.rowconfigure(3, weight=1)
+    container.rowconfigure(2, weight=1)
 
     header = ttk.Label(container, text="FightingOverlay Control Center", style="Header.TLabel")
     header.grid(row=0, column=0, sticky="w")
@@ -491,7 +570,9 @@ def main() -> None:
     meta.grid(row=1, column=0, sticky="w", pady=(4, 16))
 
     notebook = ttk.Notebook(container)
-    notebook.grid(row=2, column=0, sticky="nsew")
+    paned_main = ttk.Panedwindow(container, orient="vertical")
+    paned_main.grid(row=2, column=0, sticky="nsew")
+    paned_main.add(notebook, weight=4)
 
     run_tab, run_content = create_scrollable_tab(notebook, theme)
     data_tab, data_content = create_scrollable_tab(notebook, theme)
@@ -641,6 +722,7 @@ def main() -> None:
     dev_log_scroll = ttk.Scrollbar(dev_log_frame, command=dev_log_text.yview)
     dev_log_scroll.grid(row=0, column=1, sticky="ns")
     dev_log_text.configure(yscrollcommand=dev_log_scroll.set)
+    bind_mousewheel(dev_log_text)
 
     dev_handler = FilteredTkTextHandler(dev_log_text, root, dev_log_filter_var)
     dev_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -661,6 +743,7 @@ def main() -> None:
     dev_artifacts_scroll = ttk.Scrollbar(dev_artifacts_frame, command=dev_artifacts_list.yview)
     dev_artifacts_scroll.grid(row=0, column=1, sticky="ns")
     dev_artifacts_list.configure(yscrollcommand=dev_artifacts_scroll.set)
+    bind_mousewheel(dev_artifacts_list)
 
     dev_artifacts_actions = ttk.Frame(dev_right_content)
     dev_artifacts_actions.grid(row=4, column=0, sticky="ew")
@@ -678,6 +761,182 @@ def main() -> None:
     dev_artifacts_actions.columnconfigure(3, weight=1)
 
     refresh_artifacts()
+
+    def update_pending_count() -> None:
+        pending_paths = list_packet_paths(get_codex_packets_root())
+        pending_count_var.set(f"Pending packets: {len(pending_paths)}")
+
+    def build_debug_pack_status() -> dict[str, object]:
+        output_root = get_outputs_root()
+        manifest = load_debug_pack_manifest(output_root)
+        latest_pack = get_latest_debug_pack_dir(output_root)
+        file_count = len(list(latest_pack.glob("*"))) if latest_pack else 0
+        return {
+            "manifest": manifest,
+            "latest_pack_dir": str(latest_pack) if latest_pack else None,
+            "latest_pack_file_count": file_count,
+        }
+
+    def build_codex_packet() -> dict[str, object]:
+        log_root = get_log_root()
+        summary_block, summary_path = load_latest_evaluation_summary(log_root)
+        evaluation_json_paths = load_recent_evaluation_json_paths(log_root)
+        debug_pack_status = build_debug_pack_status()
+        manifest = debug_pack_status.get("manifest", {})
+        overlay_stats = None
+        track_summary = None
+        if isinstance(manifest, dict):
+            overlay_stats = manifest.get("overlay_stats")
+            track_summary = manifest.get("track_summary")
+        return {
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "evaluation_summary": summary_block or run_state.get("evaluation_summary"),
+            "evaluation_summary_path": str(summary_path) if summary_path else run_state.get("evaluation_text_path"),
+            "evaluation_json_paths": evaluation_json_paths,
+            "evaluation_stats": run_state.get("evaluation_stats"),
+            "overlay_stats": overlay_stats,
+            "track_summary": track_summary,
+            "problems": run_state.get("problems", []),
+            "last_error": run_state.get("last_error"),
+            "stack_trace": run_state.get("stack_trace"),
+            "run_config": {
+                "model_backend": (overlay_stats or {}).get("model_backend") or tracking_backend_var.get(),
+                "tracking_backend": tracking_backend_var.get(),
+                "confidence_threshold": float(min_conf_var.get()),
+                "smoothing_enabled": bool(smoothing_enabled_var.get()),
+                "smoothing_alpha": float(smoothing_alpha_var.get()),
+                "overlay_mode": overlay_mode_var.get(),
+                "debug_overlay": bool(debug_overlay_var.get()),
+                "run_judge": bool(run_judge_var.get()),
+            },
+            "debug_pack_status": debug_pack_status,
+            "user_note": "fighters remain center-ish in frame; data seems way off",
+        }
+
+    def format_codex_packet_text(packet: dict[str, object]) -> str:
+        lines = [
+            "Codex Fix Packet",
+            f"Created: {packet.get('created_at')}",
+            "",
+            "Evaluation Summary:",
+            str(packet.get("evaluation_summary") or "None"),
+            "",
+            "Evaluation JSON Paths:",
+        ]
+        for path in packet.get("evaluation_json_paths") or []:
+            lines.append(f"- {path}")
+        lines.extend(
+            [
+                "",
+                "Run Config:",
+                json.dumps(packet.get("run_config", {}), indent=2),
+                "",
+                "Debug Pack Status:",
+                json.dumps(packet.get("debug_pack_status", {}), indent=2),
+                "",
+                "Track Summary:",
+                json.dumps(packet.get("track_summary", {}), indent=2),
+                "",
+                "Overlay Stats:",
+                json.dumps(packet.get("overlay_stats", {}), indent=2),
+                "",
+                "Problems / Sanity Checks:",
+                json.dumps(packet.get("problems", []), indent=2),
+                "",
+                "Last Error:",
+                str(packet.get("last_error") or "None"),
+                "",
+                "Stack Trace:",
+                str(packet.get("stack_trace") or "None"),
+                "",
+                "User Note:",
+                str(packet.get("user_note") or ""),
+            ]
+        )
+        return "\n".join(lines)
+
+    def copy_to_clipboard(text: str) -> None:
+        root.clipboard_clear()
+        root.clipboard_append(text)
+
+    def save_pending_packet(packet: dict[str, object]) -> Path | None:
+        if not packet.get("evaluation_summary") and not packet.get("last_error") and not packet.get("overlay_stats"):
+            return None
+        pending_root = get_codex_packets_root()
+        pending_root.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = pending_root / f"codex_packet_{timestamp}.json"
+        path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
+        return path
+
+    def write_codex_packet_text(packet: dict[str, object]) -> Path:
+        output_dir = get_outputs_root()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = output_dir / f"codex_fix_packet_{timestamp}.txt"
+        path.write_text(format_codex_packet_text(packet), encoding="utf-8")
+        return path
+
+    def on_copy_eval_warning() -> None:
+        warning = (
+            "[EVAL] Low pose coverage detected. Try lowering the confidence threshold "
+            "or enable diagnostic mode for troubleshooting."
+        )
+        summary_block, _ = load_latest_evaluation_summary(get_log_root())
+        message = warning
+        if summary_block:
+            message = f"{warning}\n\n{summary_block}"
+        copy_to_clipboard(message)
+        messagebox.showinfo(
+            "Copied",
+            f"Evaluation warning and summary copied to clipboard.\n\n{summary_block or 'No summary found.'}",
+        )
+
+    def on_generate_codex_packet() -> None:
+        packet = build_codex_packet()
+        text = format_codex_packet_text(packet)
+        copy_to_clipboard(text)
+        path = write_codex_packet_text(packet)
+        messagebox.showinfo("Codex Fix Packet", f"Codex Fix Packet copied to clipboard.\nSaved: {path}")
+
+    def on_generate_plan_from_pending() -> None:
+        pending_paths = list_packet_paths(get_codex_packets_root())
+        if not pending_paths:
+            messagebox.showinfo("Pending Packets", "No pending Codex packets found.")
+            return
+        packets = []
+        for path in pending_paths:
+            try:
+                packets.append(json.loads(path.read_text(encoding="utf-8")))
+            except json.JSONDecodeError:
+                packets.append({"error": "Unreadable packet", "path": str(path)})
+        prompt_lines = [
+            "You are Codex. Review the following pending packets and provide:",
+            "1) Ranked root-cause hypotheses",
+            "2) A patch plan with file paths + key functions",
+            "3) Tests to run",
+            "",
+            "Pending packets:",
+            json.dumps(packets, indent=2),
+        ]
+        prompt_text = "\n".join(prompt_lines)
+        copy_to_clipboard(prompt_text)
+        output_dir = get_outputs_root()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        prompt_path = output_dir / f"codex_pending_prompt_{timestamp}.txt"
+        prompt_path.write_text(prompt_text, encoding="utf-8")
+        sent_root = get_sent_codex_packets_root()
+        sent_root.mkdir(parents=True, exist_ok=True)
+        for path in pending_paths:
+            shutil.move(str(path), sent_root / path.name)
+        update_pending_count()
+        messagebox.showinfo(
+            "Pending Packets Sent",
+            f"Prompt copied to clipboard.\nSaved: {prompt_path}\nMoved {len(pending_paths)} packets to sent/.",
+        )
+
+    update_pending_count()
 
     def overlay_slug(label: str) -> str:
         return OVERLAY_OPTIONS.get(label, OVERLAY_OPTIONS["Skeleton overlay"])["slug"]
@@ -1212,6 +1471,42 @@ def main() -> None:
     problems_list = Text(problems_frame, height=5, bg="#0f1216", fg="#e7e9ee", relief="flat", font=base_font)
     problems_list.configure(state="disabled")
     problems_list.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+    bind_mousewheel(problems_list)
+
+    codex_frame = ttk.Frame(run_content, padding=12, style="Card.TFrame")
+    codex_frame.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+    codex_frame.columnconfigure(0, weight=1)
+    codex_frame.columnconfigure(1, weight=1)
+    codex_frame.columnconfigure(2, weight=1)
+
+    ttk.Label(codex_frame, text="Codex Fix Packets", style="Subheader.TLabel").grid(
+        row=0, column=0, sticky="w"
+    )
+    ttk.Label(codex_frame, textvariable=pending_count_var, style="Card.TLabel").grid(
+        row=0, column=1, sticky="w"
+    )
+
+    copy_warning_button = ttk.Button(
+        codex_frame,
+        text="Copy Low Pose Warning + Summary",
+        command=on_copy_eval_warning,
+    )
+    copy_warning_button.grid(row=1, column=0, sticky="ew", pady=(6, 0), padx=(0, 6))
+
+    codex_packet_button = ttk.Button(
+        codex_frame,
+        text="Generate Codex Fix Packet",
+        style="Accent.TButton",
+        command=on_generate_codex_packet,
+    )
+    codex_packet_button.grid(row=1, column=1, sticky="ew", pady=(6, 0), padx=(0, 6))
+
+    codex_pending_button = ttk.Button(
+        codex_frame,
+        text="Generate Plan from Pending + Send",
+        command=on_generate_plan_from_pending,
+    )
+    codex_pending_button.grid(row=1, column=2, sticky="ew", pady=(6, 0))
 
     data_content.columnconfigure(0, weight=1)
 
@@ -1261,6 +1556,7 @@ def main() -> None:
     update_notes_text = Text(update_group, height=6, bg="#0f1216", fg="#e7e9ee", relief="flat", font=base_font)
     update_notes_text.grid(row=5, column=1, sticky="ew")
     update_notes_text.configure(state="disabled")
+    bind_mousewheel(update_notes_text)
 
     update_error_label = ttk.Label(update_group, textvariable=update_error_var, style="Card.TLabel", foreground="#f2994a")
     update_error_label.grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
@@ -1289,12 +1585,34 @@ def main() -> None:
     update_history_text = Text(update_group, height=5, bg="#0f1216", fg="#e7e9ee", relief="flat", font=base_font)
     update_history_text.grid(row=8, column=1, sticky="ew", pady=(8, 0))
     update_history_text.configure(state="disabled")
+    bind_mousewheel(update_history_text)
 
     set_release_notes(update_release_notes_var.get())
     refresh_update_history_list()
 
+    ui_group = ttk.LabelFrame(settings_content, text="UI Preferences", padding=12)
+    ui_group.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+    ui_group.columnconfigure(1, weight=1)
+
+    ttk.Label(ui_group, text="UI scale multiplier", style="Card.TLabel").grid(row=0, column=0, sticky="w")
+    ui_scale_slider = ttk.Scale(ui_group, from_=0.8, to=1.6, variable=ui_scale_var)
+    ui_scale_slider.grid(row=0, column=1, sticky="ew")
+    ui_scale_value = ttk.Label(ui_group, textvariable=ui_scale_var, style="Card.TLabel")
+    ui_scale_value.grid(row=0, column=2, sticky="w", padx=(6, 0))
+
+    ttk.Label(ui_group, text="Base font size (1080p)", style="Card.TLabel").grid(row=1, column=0, sticky="w")
+    ui_font_spin = ttk.Spinbox(ui_group, from_=9, to=32, textvariable=ui_font_size_var, width=6)
+    ui_font_spin.grid(row=1, column=1, sticky="w")
+
+    ttk.Label(ui_group, text="Restart to apply UI changes.", style="Card.TLabel").grid(
+        row=2,
+        column=0,
+        columnspan=3,
+        sticky="w",
+        pady=(6, 0),
+    )
+
     log_frame = ttk.LabelFrame(container, text="Logs", padding=8)
-    log_frame.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
     log_frame.columnconfigure(0, weight=1)
     log_frame.rowconfigure(0, weight=1)
 
@@ -1305,6 +1623,9 @@ def main() -> None:
     log_scroll = ttk.Scrollbar(log_frame, command=log_text.yview)
     log_scroll.grid(row=0, column=1, sticky="ns")
     log_text.configure(yscrollcommand=log_scroll.set)
+    bind_mousewheel(log_text)
+    paned_main.add(log_frame, weight=1)
+    paned_main.paneconfigure(log_frame, minsize=0)
 
     handler = TkTextHandler(log_text, root)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -1337,6 +1658,8 @@ def main() -> None:
             smoothing_scale,
             conf_scale,
             reset_button,
+            ui_scale_slider,
+            ui_font_spin,
         ]
     )
 
@@ -1373,6 +1696,8 @@ def main() -> None:
     bind_setting(foreground_mode_var, "foreground_mode", str)
     bind_setting(manual_tracks_var, "manual_track_ids", str)
     bind_setting(update_channel_var, "update_channel", str)
+    bind_setting(ui_scale_var, "ui_scale_multiplier", float)
+    bind_setting(ui_font_size_var, "ui_font_size", int)
 
     def clamp_max_tracks() -> None:
         try:
@@ -1491,8 +1816,16 @@ def main() -> None:
             error_var.set("Mapping warning: keypoints out of bounds")
         if "error" in info:
             error_var.set(f"Last error: {info['error']}")
+            run_state["last_error"] = str(info["error"])
         if "evaluation_summary" in info:
             evaluation_var.set(f"Evaluation: {info['evaluation_summary']}")
+            run_state["evaluation_summary"] = info.get("evaluation_summary")
+        if "evaluation_stats" in info:
+            run_state["evaluation_stats"] = info.get("evaluation_stats")
+        if "evaluation_json" in info:
+            run_state["evaluation_json_path"] = info.get("evaluation_json")
+        if "evaluation_text" in info:
+            run_state["evaluation_text_path"] = info.get("evaluation_text")
         if "evaluation_warning" in info:
             problem_buffer.appendleft(f"[EVAL] {info['evaluation_warning']}")
             problems_list.configure(state="normal")
@@ -1510,6 +1843,7 @@ def main() -> None:
                 if bundle_dir:
                     dev_bundle_var.set(f"Bundle: {bundle_dir}")
                 refresh_artifacts()
+                run_state["judge_output"] = judge_output
         if "problem" in info:
             problem = info.get("problem", {})
             if isinstance(problem, dict):
@@ -1520,6 +1854,7 @@ def main() -> None:
                 problems_list.delete("1.0", "end")
                 problems_list.insert("end", "\n".join(problem_buffer))
                 problems_list.configure(state="disabled")
+                run_state.setdefault("problems", []).append(problem)
         if "preview_frame_index" in info and "preview_total_frames" in info:
             preview_stats_var.set(f"Preview {info['preview_frame_index']} / {info['preview_total_frames']}")
         if "preview_image" in info:
@@ -1562,6 +1897,14 @@ def main() -> None:
         problems_list.configure(state="normal")
         problems_list.delete("1.0", "end")
         problems_list.configure(state="disabled")
+        run_state["evaluation_summary"] = None
+        run_state["evaluation_text_path"] = None
+        run_state["evaluation_json_path"] = None
+        run_state["evaluation_stats"] = None
+        run_state["stack_trace"] = None
+        run_state["last_error"] = None
+        run_state["problems"] = []
+        run_state["judge_output"] = None
 
         def status_callback(message: str, progress_value: float | None) -> None:
             root.after(0, update_status, message, progress_value)
@@ -1570,6 +1913,7 @@ def main() -> None:
             root.after(0, update_info, info)
 
         def run_background() -> None:
+            run_status = "success"
             try:
                 mode = foreground_mode_var.get()
                 if mode != "Auto (closest/most active)":
@@ -1614,14 +1958,23 @@ def main() -> None:
                 root.after(0, messagebox.showinfo, "Run Overlay", "Processing complete.")
             except ProcessingCancelled:
                 logging.warning("Processing cancelled by user.")
+                run_status = "cancelled"
                 root.after(0, update_status, "Processing cancelled.", 0)
                 root.after(0, update_info, {"stage": "Cancelled"})
             except Exception as exc:
                 logging.exception("Processing failed: %s", exc)
+                run_status = "failed"
+                run_state["stack_trace"] = traceback.format_exc()
                 root.after(0, update_info, {"error": exc, "stage": "Failed"})
                 root.after(0, messagebox.showerror, "Run Overlay", f"Processing failed: {exc}")
                 root.after(0, update_status, "Processing failed.", 0)
             finally:
+                if run_status in {"success", "failed"}:
+                    packet = build_codex_packet()
+                    path = save_pending_packet(packet)
+                    if path:
+                        logging.info("Saved pending Codex packet: %s", path)
+                    root.after(0, update_pending_count)
                 def _finish() -> None:
                     set_running(False)
                     if install_after_job["pending"]:

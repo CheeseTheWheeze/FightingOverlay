@@ -73,6 +73,10 @@ class JudgeMetricsTests(unittest.TestCase):
         self.assertTrue(swap_flags["a"])
         self.assertFalse(swap_flags["b"])
 
+    def test_compute_metrics_handles_empty_tracks(self) -> None:
+        metrics = compute_metrics([], {}, JudgeConfig(min_keypoint_confidence=0.1))
+        self.assertEqual(metrics, [])
+
 
 if __name__ == "__main__":
     unittest.main()
