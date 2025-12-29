@@ -13,6 +13,13 @@ def _require_local_appdata() -> Path:
     return Path(local_appdata)
 
 
+def _require_roaming_appdata() -> Path:
+    roaming_appdata = os.environ.get("APPDATA")
+    if not roaming_appdata:
+        raise RuntimeError("APPDATA is not set. This app requires Windows.")
+    return Path(roaming_appdata)
+
+
 def get_app_root() -> Path:
     return _require_local_appdata() / APP_NAME / "app"
 
@@ -51,3 +58,7 @@ def get_bootstrap_root() -> Path:
 
 def get_bootstrapper_path() -> Path:
     return get_bootstrap_root() / "FightingOverlayBootstrap.exe"
+
+
+def get_settings_path() -> Path:
+    return _require_roaming_appdata() / APP_NAME / "settings.json"

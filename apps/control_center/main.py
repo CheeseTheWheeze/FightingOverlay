@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+from collections import deque
 import json
 import logging
 import subprocess
@@ -8,7 +10,7 @@ import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
-from tkinter import BooleanVar, DoubleVar, StringVar, Text, Tk, filedialog, messagebox, ttk
+from tkinter import BooleanVar, DoubleVar, IntVar, PhotoImage, StringVar, Text, Tk, filedialog, messagebox, ttk
 
 from core.paths import (
     get_app_root,
@@ -20,6 +22,7 @@ from core.paths import (
     get_outputs_root,
 )
 from core.pipeline import ProcessingCancelled, ProcessingOptions, run_pipeline
+from core.settings import load_settings, save_settings
 from core.schema import validate_pose_tracks_schema
 
 RELEASES_URL = "https://api.github.com/repos/CheeseTheWheeze/FightingOverlay/releases/latest"
@@ -169,6 +172,29 @@ def main() -> None:
     if not check_opencv(show_dialog=not args.test_mode):
         return
 
+    defaults = {
+        "debug_overlay": False,
+        "draw_all_tracks": False,
+        "render_mode": "Skeleton (lines+dots)",
+        "confidence_threshold": 0.3,
+        "smoothing_enabled": True,
+        "smoothing_alpha": 0.7,
+        "max_tracks": 3,
+        "track_sort": "Top confidence",
+        "live_preview": True,
+        "run_evaluation": False,
+        "export_overlay": True,
+        "save_pose_json": True,
+        "save_thumbnails": False,
+        "save_background_tracks": True,
+        "tracking_backend": "Motion (fast)",
+        "foreground_mode": "Auto (closest/most active)",
+        "manual_track_ids": "",
+        "last_video_path": "",
+        "last_output_path": str(get_outputs_root()),
+    }
+    settings = load_settings(defaults)
+
     if args.test_mode:
         options = ProcessingOptions(
             export_overlay_video=False,
@@ -185,7 +211,8 @@ def main() -> None:
     root.title("FightingOverlay Control Center")
     root.geometry("980x720")
 
-    selected_video = StringVar(value="No video selected")
+    last_video = settings.get("last_video_path") or ""
+    selected_video = StringVar(value=last_video if last_video else "No video selected")
     status_var = StringVar(value="Idle")
     run_stage_var = StringVar(value="Idle")
     frame_stats_var = StringVar(value="Frame -/-")
@@ -197,18 +224,27 @@ def main() -> None:
     people_var = StringVar(value="People: --")
     realtime_var = StringVar(value="Realtime: --")
     error_var = StringVar(value="Last error: None")
+    evaluation_var = StringVar(value="Evaluation: --")
+    preview_stats_var = StringVar(value="Preview -/-")
+    all_tracks_warning_var = StringVar(value="")
 
-    export_overlay_var = BooleanVar(value=True)
-    save_pose_var = BooleanVar(value=True)
-    save_thumbnails_var = BooleanVar(value=False)
-    save_background_var = BooleanVar(value=True)
-    debug_overlay_var = BooleanVar(value=False)
-    draw_all_tracks_var = BooleanVar(value=False)
-    foreground_mode_var = StringVar(value="Auto (closest/most active)")
-    manual_tracks_var = StringVar(value="")
-    smoothing_alpha_var = DoubleVar(value=0.7)
-    min_conf_var = DoubleVar(value=0.2)
-    tracking_backend_var = StringVar(value="Motion (fast)")
+    export_overlay_var = BooleanVar(value=bool(settings.get("export_overlay")))
+    save_pose_var = BooleanVar(value=bool(settings.get("save_pose_json")))
+    save_thumbnails_var = BooleanVar(value=bool(settings.get("save_thumbnails")))
+    save_background_var = BooleanVar(value=bool(settings.get("save_background_tracks")))
+    debug_overlay_var = BooleanVar(value=bool(settings.get("debug_overlay")))
+    draw_all_tracks_var = BooleanVar(value=bool(settings.get("draw_all_tracks")))
+    render_mode_var = StringVar(value=str(settings.get("render_mode")))
+    max_tracks_var = IntVar(value=int(settings.get("max_tracks") or 3))
+    track_sort_var = StringVar(value=str(settings.get("track_sort")))
+    live_preview_var = BooleanVar(value=bool(settings.get("live_preview")))
+    run_evaluation_var = BooleanVar(value=bool(settings.get("run_evaluation")))
+    smoothing_enabled_var = BooleanVar(value=bool(settings.get("smoothing_enabled")))
+    foreground_mode_var = StringVar(value=str(settings.get("foreground_mode")))
+    manual_tracks_var = StringVar(value=str(settings.get("manual_track_ids")))
+    smoothing_alpha_var = DoubleVar(value=float(settings.get("smoothing_alpha") or 0.7))
+    min_conf_var = DoubleVar(value=float(settings.get("confidence_threshold") or 0.3))
+    tracking_backend_var = StringVar(value=str(settings.get("tracking_backend")))
 
     cancel_event = threading.Event()
 
@@ -241,6 +277,7 @@ def main() -> None:
     notebook.add(settings_tab, text="Settings")
 
     run_tab.columnconfigure(1, weight=1)
+    run_tab.rowconfigure(5, weight=1)
 
     ttk.Label(run_tab, text="Source Video", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
     ttk.Label(run_tab, textvariable=selected_video, style="Card.TLabel").grid(
@@ -254,6 +291,8 @@ def main() -> None:
         )
         if path:
             selected_video.set(path)
+            settings["last_video_path"] = path
+            save_settings(settings)
             logging.info("Selected video: %s", path)
 
     def on_open_outputs() -> None:
@@ -291,19 +330,173 @@ def main() -> None:
     action_buttons: list[ttk.Button] = []
     settings_controls: list[ttk.Widget] = []
 
-    open_button = ttk.Button(run_tab, text="Open Video", style="Accent.TButton", command=on_open_video)
-    open_button.grid(row=2, column=0, sticky="ew", padx=(0, 12))
+    run_actions = ttk.Frame(run_tab)
+    run_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+    run_actions.columnconfigure(0, weight=1)
+    run_actions.columnconfigure(1, weight=1)
 
-    run_button = ttk.Button(run_tab, text="Run Overlay", style="Accent.TButton")
-    run_button.grid(row=2, column=1, sticky="ew")
+    open_button = ttk.Button(run_actions, text="Open Video", style="Accent.TButton", command=on_open_video)
+    open_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
 
-    cancel_button = ttk.Button(run_tab, text="Cancel", command=lambda: cancel_event.set())
-    cancel_button.grid(row=3, column=1, sticky="e", pady=(10, 0))
+    run_button = ttk.Button(run_actions, text="Run Overlay", style="Accent.TButton")
+    run_button.grid(row=0, column=1, sticky="ew")
 
-    action_buttons.extend([open_button, run_button])
+    advanced_visible = BooleanVar(value=False)
+
+    def toggle_advanced() -> None:
+        if advanced_visible.get():
+            advanced_frame.grid_remove()
+            advanced_visible.set(False)
+            advanced_toggle.configure(text="Advanced ▸")
+        else:
+            advanced_frame.grid()
+            advanced_visible.set(True)
+            advanced_toggle.configure(text="Advanced ▾")
+
+    advanced_toggle = ttk.Button(run_actions, text="Advanced ▸", command=toggle_advanced)
+    advanced_toggle.grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+    cancel_button = ttk.Button(run_actions, text="Cancel", command=lambda: cancel_event.set())
+    cancel_button.grid(row=1, column=1, sticky="e", pady=(6, 0))
+
+    action_buttons.extend([open_button, run_button, advanced_toggle])
+
+    advanced_frame = ttk.Frame(run_tab, padding=12, style="Card.TFrame")
+    advanced_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+    advanced_frame.columnconfigure(0, weight=1)
+    advanced_frame.columnconfigure(1, weight=1)
+    advanced_frame.grid_remove()
+
+    ttk.Label(advanced_frame, text="Advanced Options", style="Card.TLabel").grid(
+        row=0, column=0, columnspan=2, sticky="w", pady=(0, 6)
+    )
+
+    export_overlay_check = ttk.Checkbutton(
+        advanced_frame,
+        text="Export overlay video (MP4)",
+        variable=export_overlay_var,
+    )
+    export_overlay_check.grid(row=1, column=0, sticky="w")
+    save_pose_check = ttk.Checkbutton(advanced_frame, text="Save pose JSON", variable=save_pose_var)
+    save_pose_check.grid(row=1, column=1, sticky="w")
+
+    save_thumbnails_check = ttk.Checkbutton(
+        advanced_frame,
+        text="Save thumbnails (1 per second)",
+        variable=save_thumbnails_var,
+    )
+    save_thumbnails_check.grid(row=2, column=0, sticky="w")
+    save_background_check = ttk.Checkbutton(
+        advanced_frame,
+        text="Save background tracks (track everyone)",
+        variable=save_background_var,
+    )
+    save_background_check.grid(row=2, column=1, sticky="w")
+
+    debug_overlay_check = ttk.Checkbutton(
+        advanced_frame,
+        text="Debug overlay (mapping primitives)",
+        variable=debug_overlay_var,
+    )
+    debug_overlay_check.grid(row=3, column=0, sticky="w")
+    draw_all_tracks_check = ttk.Checkbutton(
+        advanced_frame,
+        text="Draw all tracks (debug)",
+        variable=draw_all_tracks_var,
+    )
+    draw_all_tracks_check.grid(row=3, column=1, sticky="w")
+
+    draw_all_warning = ttk.Label(
+        advanced_frame,
+        text="All-tracks view can look cluttered; use Dots-only + Top-N filter.",
+        style="Card.TLabel",
+    )
+    draw_all_warning.grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 6))
+
+    ttk.Label(advanced_frame, text="Render mode", style="Card.TLabel").grid(row=5, column=0, sticky="w")
+    render_mode_combo = ttk.Combobox(
+        advanced_frame,
+        textvariable=render_mode_var,
+        values=["Dots only", "Skeleton (lines+dots)"],
+        state="readonly",
+    )
+    render_mode_combo.grid(row=5, column=1, sticky="ew")
+
+    ttk.Label(advanced_frame, text="Confidence threshold", style="Card.TLabel").grid(row=6, column=0, sticky="w")
+    conf_scale = ttk.Scale(advanced_frame, from_=0.0, to=1.0, variable=min_conf_var)
+    conf_scale.grid(row=6, column=1, sticky="ew")
+
+    smoothing_enabled_check = ttk.Checkbutton(
+        advanced_frame,
+        text="EMA smoothing",
+        variable=smoothing_enabled_var,
+    )
+    smoothing_enabled_check.grid(row=7, column=0, sticky="w")
+    smoothing_scale = ttk.Scale(advanced_frame, from_=0.0, to=1.0, variable=smoothing_alpha_var)
+    smoothing_scale.grid(row=7, column=1, sticky="ew")
+
+    ttk.Label(advanced_frame, text="Max tracks (all-tracks)", style="Card.TLabel").grid(row=8, column=0, sticky="w")
+    max_tracks_spin = ttk.Spinbox(advanced_frame, from_=1, to=10, textvariable=max_tracks_var, width=5)
+    max_tracks_spin.grid(row=8, column=1, sticky="w")
+
+    ttk.Label(advanced_frame, text="Track ranking", style="Card.TLabel").grid(row=9, column=0, sticky="w")
+    track_sort_combo = ttk.Combobox(
+        advanced_frame,
+        textvariable=track_sort_var,
+        values=["Top confidence", "Most continuous"],
+        state="readonly",
+    )
+    track_sort_combo.grid(row=9, column=1, sticky="ew")
+
+    ttk.Label(advanced_frame, text="Tracking backend", style="Card.TLabel").grid(row=10, column=0, sticky="w")
+    backend_combo = ttk.Combobox(
+        advanced_frame,
+        textvariable=tracking_backend_var,
+        values=[
+            "Motion (fast)",
+            "Synthetic (demo)",
+        ],
+        state="readonly",
+    )
+    backend_combo.grid(row=10, column=1, sticky="ew")
+
+    ttk.Label(advanced_frame, text="Foreground selection mode", style="Card.TLabel").grid(row=11, column=0, sticky="w")
+    mode_combo = ttk.Combobox(
+        advanced_frame,
+        textvariable=foreground_mode_var,
+        values=[
+            "Auto (closest/most active)",
+            "Manual pick",
+            "Foreground=Top2 largest",
+        ],
+        state="readonly",
+    )
+    mode_combo.grid(row=11, column=1, sticky="ew")
+
+    ttk.Label(advanced_frame, text="Manual track IDs (comma-separated)", style="Card.TLabel").grid(
+        row=12, column=0, sticky="w"
+    )
+    manual_entry = ttk.Entry(advanced_frame, textvariable=manual_tracks_var)
+    manual_entry.grid(row=12, column=1, sticky="ew")
+
+    live_preview_check = ttk.Checkbutton(
+        advanced_frame,
+        text="Live preview while processing",
+        variable=live_preview_var,
+    )
+    live_preview_check.grid(row=13, column=0, sticky="w")
+    run_eval_check = ttk.Checkbutton(
+        advanced_frame,
+        text="Run evaluation after processing",
+        variable=run_evaluation_var,
+    )
+    run_eval_check.grid(row=13, column=1, sticky="w")
+
+    reset_button = ttk.Button(advanced_frame, text="Reset to defaults")
+    reset_button.grid(row=14, column=1, sticky="e", pady=(6, 0))
 
     quick_actions = ttk.Frame(run_tab, padding=8, style="Card.TFrame")
-    quick_actions.grid(row=3, column=0, sticky="w", pady=(10, 0))
+    quick_actions.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
     quick_actions.columnconfigure(0, weight=1)
     quick_actions.columnconfigure(1, weight=1)
 
@@ -322,11 +515,14 @@ def main() -> None:
     ttk.Label(status_frame, text="Details", style="Card.TLabel").grid(row=1, column=0, sticky="w")
     ttk.Label(status_frame, textvariable=status_var, style="Card.TLabel").grid(row=1, column=1, sticky="w")
 
+    warning_label = ttk.Label(status_frame, textvariable=all_tracks_warning_var, style="Card.TLabel", foreground="#f2c94c")
+    warning_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
     progress = ttk.Progressbar(status_frame, mode="determinate", maximum=100)
-    progress.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+    progress.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
     stats_frame = ttk.Frame(status_frame, padding=(0, 8), style="Card.TFrame")
-    stats_frame.grid(row=3, column=0, columnspan=2, sticky="ew")
+    stats_frame.grid(row=4, column=0, columnspan=2, sticky="ew")
     stats_frame.columnconfigure(1, weight=1)
 
     ttk.Label(stats_frame, text="Frame", style="Card.TLabel").grid(row=0, column=0, sticky="w")
@@ -347,24 +543,38 @@ def main() -> None:
     ttk.Label(stats_frame, textvariable=people_var, style="Card.TLabel").grid(row=7, column=1, sticky="w")
     ttk.Label(stats_frame, text="Last error", style="Card.TLabel").grid(row=8, column=0, sticky="w")
     ttk.Label(stats_frame, textvariable=error_var, style="Card.TLabel").grid(row=8, column=1, sticky="w")
+    ttk.Label(stats_frame, text="Evaluation", style="Card.TLabel").grid(row=9, column=0, sticky="w")
+    ttk.Label(stats_frame, textvariable=evaluation_var, style="Card.TLabel").grid(row=9, column=1, sticky="w")
 
     ttk.Label(status_frame, text="Last update: " + load_last_update(), style="Card.TLabel").grid(
-        row=4, column=0, columnspan=2, sticky="w", pady=(6, 0)
+        row=5, column=0, columnspan=2, sticky="w", pady=(6, 0)
     )
+
+    preview_frame = ttk.Frame(run_tab, padding=12, style="Card.TFrame")
+    preview_frame.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
+    preview_frame.columnconfigure(0, weight=1)
+
+    ttk.Label(preview_frame, text="Live Preview", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(preview_frame, textvariable=preview_stats_var, style="Card.TLabel").grid(row=0, column=1, sticky="e")
+
+    preview_label = ttk.Label(preview_frame, text="Preview will appear while processing", style="Card.TLabel")
+    preview_label.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+
+    problems_frame = ttk.Frame(run_tab, padding=12, style="Card.TFrame")
+    problems_frame.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+    problems_frame.columnconfigure(0, weight=1)
+
+    ttk.Label(problems_frame, text="Problems", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
+    problems_list = Text(problems_frame, height=5, bg="#0f1216", fg="#e7e9ee", relief="flat")
+    problems_list.configure(state="disabled")
+    problems_list.grid(row=1, column=0, sticky="ew", pady=(6, 0))
 
     data_tab.columnconfigure(0, weight=1)
 
-    data_group = ttk.LabelFrame(data_tab, text="Output Options", padding=12)
+    data_group = ttk.LabelFrame(data_tab, text="Storage", padding=12)
     data_group.grid(row=0, column=0, sticky="ew")
-
-    save_pose_check = ttk.Checkbutton(data_group, text="Save pose JSON", variable=save_pose_var)
-    save_pose_check.grid(row=0, column=0, sticky="w")
-    save_thumbnails_check = ttk.Checkbutton(data_group, text="Save thumbnails (1 per second)", variable=save_thumbnails_var)
-    save_thumbnails_check.grid(row=1, column=0, sticky="w")
-    save_background_check = ttk.Checkbutton(
-        data_group, text="Save background tracks (track everyone)", variable=save_background_var
-    )
-    save_background_check.grid(row=2, column=0, sticky="w")
+    ttk.Label(data_group, text=f"Outputs: {get_outputs_root()}").grid(row=0, column=0, sticky="w")
+    ttk.Label(data_group, text=f"Logs: {get_log_root()}").grid(row=1, column=0, sticky="w")
 
     data_actions = ttk.Frame(data_tab, padding=12, style="Card.TFrame")
     data_actions.grid(row=1, column=0, sticky="ew", pady=(12, 0))
@@ -378,70 +588,14 @@ def main() -> None:
 
     settings_tab.columnconfigure(0, weight=1)
 
-    settings_group = ttk.LabelFrame(settings_tab, text="Processing", padding=12)
-    settings_group.grid(row=0, column=0, sticky="ew")
-
-    export_overlay_check = ttk.Checkbutton(settings_group, text="Export overlay video (MP4)", variable=export_overlay_var)
-    export_overlay_check.grid(row=0, column=0, sticky="w")
-    debug_overlay_check = ttk.Checkbutton(
-        settings_group,
-        text="Debug overlay (mapping primitives)",
-        variable=debug_overlay_var,
-    )
-    debug_overlay_check.grid(row=1, column=0, sticky="w")
-    draw_all_tracks_check = ttk.Checkbutton(
-        settings_group,
-        text="Draw all tracks (debug)",
-        variable=draw_all_tracks_var,
-    )
-    draw_all_tracks_check.grid(row=2, column=0, sticky="w")
-
-    ttk.Label(settings_group, text="Tracking backend").grid(row=3, column=0, sticky="w", pady=(8, 2))
-    backend_combo = ttk.Combobox(
-        settings_group,
-        textvariable=tracking_backend_var,
-        values=[
-            "Motion (fast)",
-            "Synthetic (demo)",
-        ],
-        state="readonly",
-    )
-    backend_combo.grid(row=4, column=0, sticky="ew")
-
-    ttk.Label(settings_group, text="Foreground selection mode").grid(row=5, column=0, sticky="w", pady=(8, 2))
-    mode_combo = ttk.Combobox(
-        settings_group,
-        textvariable=foreground_mode_var,
-        values=[
-            "Auto (closest/most active)",
-            "Manual pick",
-            "Foreground=Top2 largest",
-        ],
-        state="readonly",
-    )
-    mode_combo.grid(row=6, column=0, sticky="ew")
-
-    ttk.Label(settings_group, text="Manual track IDs (comma-separated)").grid(row=7, column=0, sticky="w", pady=(8, 2))
-    manual_entry = ttk.Entry(settings_group, textvariable=manual_tracks_var)
-    manual_entry.grid(row=8, column=0, sticky="ew")
-
-    ttk.Label(settings_group, text="Smoothing (higher = steadier)").grid(row=9, column=0, sticky="w", pady=(8, 2))
-    smoothing_scale = ttk.Scale(settings_group, from_=0.0, to=1.0, variable=smoothing_alpha_var)
-    smoothing_scale.grid(row=10, column=0, sticky="ew")
-
-    ttk.Label(settings_group, text="Min keypoint confidence").grid(row=11, column=0, sticky="w", pady=(8, 2))
-    conf_scale = ttk.Scale(settings_group, from_=0.0, to=1.0, variable=min_conf_var)
-    conf_scale.grid(row=12, column=0, sticky="ew")
-
     update_group = ttk.LabelFrame(settings_tab, text="Updates", padding=12)
-    update_group.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+    update_group.grid(row=0, column=0, sticky="ew")
 
     updates_button = ttk.Button(update_group, text="Check Updates", command=on_check_updates)
     update_now_button = ttk.Button(update_group, text="Update Now", style="Accent.TButton", command=on_update_now)
     updates_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
     update_now_button.grid(row=0, column=1, sticky="ew")
 
-    settings_group.columnconfigure(0, weight=1)
     update_group.columnconfigure(0, weight=1)
     update_group.columnconfigure(1, weight=1)
 
@@ -462,6 +616,8 @@ def main() -> None:
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logging.getLogger().addHandler(handler)
 
+    problem_buffer: deque[str] = deque(maxlen=6)
+
     settings_controls.extend(
         [
             save_pose_check,
@@ -470,13 +626,89 @@ def main() -> None:
             export_overlay_check,
             debug_overlay_check,
             draw_all_tracks_check,
+            render_mode_combo,
+            max_tracks_spin,
+            track_sort_combo,
+            live_preview_check,
+            run_eval_check,
+            smoothing_enabled_check,
             backend_combo,
             mode_combo,
             manual_entry,
             smoothing_scale,
             conf_scale,
+            reset_button,
         ]
     )
+
+    def save_setting(key: str, value: object) -> None:
+        settings[key] = value
+        save_settings(settings)
+
+    def bind_setting(var, key: str, cast=None) -> None:
+        def _on_change(*_args: object) -> None:
+            value = var.get()
+            if cast:
+                value = cast(value)
+            save_setting(key, value)
+
+        var.trace_add("write", _on_change)
+
+    bind_setting(export_overlay_var, "export_overlay", bool)
+    bind_setting(save_pose_var, "save_pose_json", bool)
+    bind_setting(save_thumbnails_var, "save_thumbnails", bool)
+    bind_setting(save_background_var, "save_background_tracks", bool)
+    bind_setting(debug_overlay_var, "debug_overlay", bool)
+    bind_setting(draw_all_tracks_var, "draw_all_tracks", bool)
+    bind_setting(render_mode_var, "render_mode", str)
+    bind_setting(max_tracks_var, "max_tracks", int)
+    bind_setting(track_sort_var, "track_sort", str)
+    bind_setting(live_preview_var, "live_preview", bool)
+    bind_setting(run_evaluation_var, "run_evaluation", bool)
+    bind_setting(smoothing_enabled_var, "smoothing_enabled", bool)
+    bind_setting(smoothing_alpha_var, "smoothing_alpha", float)
+    bind_setting(min_conf_var, "confidence_threshold", float)
+    bind_setting(tracking_backend_var, "tracking_backend", str)
+    bind_setting(foreground_mode_var, "foreground_mode", str)
+    bind_setting(manual_tracks_var, "manual_track_ids", str)
+
+    def update_draw_all_warning() -> None:
+        if draw_all_tracks_var.get():
+            draw_all_warning.grid()
+            all_tracks_warning_var.set("All-tracks view can look cluttered; use Dots-only + Top-N filter.")
+            if render_mode_var.get() != "Dots only":
+                render_mode_var.set("Dots only")
+        else:
+            draw_all_warning.grid_remove()
+            all_tracks_warning_var.set("")
+
+    def update_smoothing_state() -> None:
+        smoothing_scale.configure(state="normal" if smoothing_enabled_var.get() else "disabled")
+
+    def reset_defaults() -> None:
+        export_overlay_var.set(defaults["export_overlay"])
+        save_pose_var.set(defaults["save_pose_json"])
+        save_thumbnails_var.set(defaults["save_thumbnails"])
+        save_background_var.set(defaults["save_background_tracks"])
+        debug_overlay_var.set(defaults["debug_overlay"])
+        draw_all_tracks_var.set(defaults["draw_all_tracks"])
+        render_mode_var.set(defaults["render_mode"])
+        max_tracks_var.set(defaults["max_tracks"])
+        track_sort_var.set(defaults["track_sort"])
+        live_preview_var.set(defaults["live_preview"])
+        run_evaluation_var.set(defaults["run_evaluation"])
+        smoothing_enabled_var.set(defaults["smoothing_enabled"])
+        smoothing_alpha_var.set(defaults["smoothing_alpha"])
+        min_conf_var.set(defaults["confidence_threshold"])
+        tracking_backend_var.set(defaults["tracking_backend"])
+        foreground_mode_var.set(defaults["foreground_mode"])
+        manual_tracks_var.set(defaults["manual_track_ids"])
+
+    reset_button.configure(command=reset_defaults)
+    update_draw_all_warning()
+    update_smoothing_state()
+    draw_all_tracks_var.trace_add("write", lambda *_: update_draw_all_warning())
+    smoothing_enabled_var.trace_add("write", lambda *_: update_smoothing_state())
 
     def set_running(running: bool) -> None:
         state = "disabled" if running else "normal"
@@ -539,6 +771,27 @@ def main() -> None:
             error_var.set("Mapping warning: keypoints out of bounds")
         if "error" in info:
             error_var.set(f"Last error: {info['error']}")
+        if "evaluation_summary" in info:
+            evaluation_var.set(f"Evaluation: {info['evaluation_summary']}")
+        if "problem" in info:
+            problem = info.get("problem", {})
+            if isinstance(problem, dict):
+                code = problem.get("code", "Problem")
+                message = problem.get("message", "")
+                problem_buffer.appendleft(f"[{code}] {message}")
+                problems_list.configure(state="normal")
+                problems_list.delete("1.0", "end")
+                problems_list.insert("end", "\n".join(problem_buffer))
+                problems_list.configure(state="disabled")
+        if "preview_frame_index" in info and "preview_total_frames" in info:
+            preview_stats_var.set(f"Preview {info['preview_frame_index']} / {info['preview_total_frames']}")
+        if "preview_image" in info:
+            preview_data = info.get("preview_image")
+            if isinstance(preview_data, (bytes, bytearray)):
+                encoded = base64.b64encode(preview_data).decode("ascii")
+                image = PhotoImage(data=encoded)
+                preview_label.configure(image=image, text="")
+                preview_label.image = image
 
     def on_run_overlay() -> None:
         if selected_video.get() == "No video selected":
@@ -547,6 +800,10 @@ def main() -> None:
         if not Path(selected_video.get()).exists():
             messagebox.showerror("Run Overlay", "Selected video file does not exist.")
             return
+
+        settings["last_video_path"] = selected_video.get()
+        settings["last_output_path"] = str(get_outputs_root())
+        save_settings(settings)
 
         cancel_event.clear()
         set_running(True)
@@ -561,6 +818,13 @@ def main() -> None:
         people_var.set("People: --")
         realtime_var.set("Realtime: --")
         error_var.set("Last error: None")
+        evaluation_var.set("Evaluation: --")
+        preview_stats_var.set("Preview -/-")
+        preview_label.configure(image="", text="Preview will appear while processing")
+        problem_buffer.clear()
+        problems_list.configure(state="normal")
+        problems_list.delete("1.0", "end")
+        problems_list.configure(state="disabled")
 
         def status_callback(message: str, progress_value: float | None) -> None:
             root.after(0, update_status, message, progress_value)
@@ -578,6 +842,8 @@ def main() -> None:
                     root.after(0, messagebox.showwarning, "Run Overlay", "Enter track IDs for Manual pick mode.")
                     root.after(0, set_running, False)
                     return
+                render_mode = "dots" if render_mode_var.get().lower().startswith("dots") else "skeleton"
+                track_sort = "continuity" if track_sort_var.get().lower().startswith("most") else "confidence"
                 options = ProcessingOptions(
                     export_overlay_video=export_overlay_var.get(),
                     save_pose_json=save_pose_var.get(),
@@ -587,7 +853,13 @@ def main() -> None:
                     debug_overlay=debug_overlay_var.get(),
                     draw_all_tracks=draw_all_tracks_var.get(),
                     smoothing_alpha=float(smoothing_alpha_var.get()),
+                    smoothing_enabled=smoothing_enabled_var.get(),
                     min_keypoint_confidence=float(min_conf_var.get()),
+                    render_mode=render_mode,
+                    max_tracks=int(max_tracks_var.get()),
+                    track_sort=track_sort,
+                    live_preview=live_preview_var.get(),
+                    run_evaluation=run_evaluation_var.get(),
                     tracking_backend=tracking_backend_var.get(),
                     manual_track_ids=manual_ids,
                 )
@@ -618,7 +890,7 @@ def main() -> None:
     run_button.configure(command=on_run_overlay)
 
     validate_button = ttk.Button(run_tab, text="Validate Output JSON schema", command=on_validate)
-    validate_button.grid(row=3, column=0, sticky="w", pady=(10, 0))
+    validate_button.grid(row=8, column=0, sticky="w", pady=(6, 0))
 
     action_buttons.append(validate_button)
 
