@@ -560,6 +560,21 @@ def _build_transform(
     crop_y = float(source.get("crop_y", 0.0))
     crop_w = float(source.get("crop_w", frame_width))
     crop_h = float(source.get("crop_h", frame_height))
+    if transform_kind == "LETTERBOX":
+        inferred_w = pad_left + float(resized_w) + pad_right
+        inferred_h = pad_top + float(resized_h) + pad_bottom
+        if abs(inferred_w - infer_w) > 1.0 or abs(inferred_h - infer_h) > 1.0:
+            logging.warning(
+                "LETTERBOX pad mismatch: infer=(%s,%s) pad+resized=(%.1f,%.1f)",
+                infer_w,
+                infer_h,
+                inferred_w,
+                inferred_h,
+            )
+    if transform_kind == "DIRECT_RESIZE" and any(value > 0.0 for value in (pad_left, pad_right, pad_top, pad_bottom)):
+        logging.warning("DIRECT_RESIZE received non-zero padding values.")
+    if transform_kind in {"CROP", "CENTER_CROP"} and (crop_w <= 0 or crop_h <= 0):
+        logging.warning("CROP transform missing crop bounds (crop_w/crop_h).")
     return {
         "coord_space": coord_space,
         "transform_kind": transform_kind,
