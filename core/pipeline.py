@@ -26,7 +26,7 @@ class ProcessingOptions:
     save_thumbnails: bool = False
     save_background_tracks: bool = True
     foreground_mode: str = "Auto (closest/most active)"
-    debug_overlay: bool = True
+    debug_overlay: bool = False
     draw_all_tracks: bool = False
     smoothing_alpha: float = 0.7
     min_keypoint_confidence: float = 0.2
@@ -744,16 +744,122 @@ def _draw_debug_corners(frame, frame_width: int, frame_height: int) -> None:
     color = (0, 255, 255)
     size = 14
     points = [
-        (0, 0, 1, 1),
-        (frame_width - 1, 0, -1, 1),
-        (0, frame_height - 1, 1, -1),
-        (frame_width - 1, frame_height - 1, -1, -1),
+        (0, 0, 1, 1, "(0,0)"),
+        (frame_width - 1, 0, -1, 1, f"({frame_width - 1},0)"),
+        (0, frame_height - 1, 1, -1, f"(0,{frame_height - 1})"),
+        (frame_width - 1, frame_height - 1, -1, -1, f"({frame_width - 1},{frame_height - 1})"),
     ]
-    for x, y, dx, dy in points:
+    for x, y, dx, dy, label in points:
         end_x = min(frame_width - 1, max(0, x + dx * size))
         end_y = min(frame_height - 1, max(0, y + dy * size))
         cv2.line(frame, (x, y), (end_x, y), color, 2)
         cv2.line(frame, (x, y), (x, end_y), color, 2)
+        text_x = min(frame_width - 1, max(0, x + dx * (size + 4)))
+        text_y = min(frame_height - 1, max(0, y + dy * (size + 4)))
+        cv2.putText(
+            frame,
+            label,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def _convert_xy_from_space(
+    x: float,
+    y: float,
+    coord_space: str,
+    transform: dict[str, float | str],
+) -> tuple[float, float]:
+    local = dict(transform)
+    local["coord_space"] = coord_space
+    return _convert_xy(x, y, local)
+
+
+def _draw_debug_regions(frame, transform: dict[str, float | str], frame_width: int, frame_height: int) -> None:
+    if cv2 is None:
+        return
+    frame_color = (0, 255, 0)
+    content_color = (255, 0, 255)
+    cv2.rectangle(frame, (0, 0), (frame_width - 1, frame_height - 1), frame_color, 2)
+
+    transform_kind = str(transform["transform_kind"]).upper()
+    if transform_kind in {"DIRECT_RESIZE", "NONE"}:
+        cv2.rectangle(frame, (0, 0), (frame_width - 1, frame_height - 1), content_color, 2)
+        return
+    if transform_kind in {"CROP", "CENTER_CROP"}:
+        crop_x = int(round(float(transform["crop_x"])))
+        crop_y = int(round(float(transform["crop_y"])))
+        crop_w = int(round(float(transform["crop_w"])))
+        crop_h = int(round(float(transform["crop_h"])))
+        cv2.rectangle(frame, (crop_x, crop_y), (crop_x + crop_w, crop_y + crop_h), content_color, 2)
+        return
+    if transform_kind == "LETTERBOX":
+        pad_left = float(transform["pad_left"])
+        pad_top = float(transform["pad_top"])
+        resized_w = float(transform["resized_w"])
+        resized_h = float(transform["resized_h"])
+        x1, y1 = _convert_xy_from_space(pad_left, pad_top, "pixels_in_infer_canvas", transform)
+        x2, y2 = _convert_xy_from_space(
+            pad_left + resized_w,
+            pad_top + resized_h,
+            "pixels_in_infer_canvas",
+            transform,
+        )
+        cv2.rectangle(
+            frame,
+            (int(round(x1)), int(round(y1))),
+            (int(round(x2)), int(round(y2))),
+            content_color,
+            2,
+        )
+
+
+def _draw_keypoint_labels(
+    frame,
+    mapped: dict[str, tuple[int, int, float]],
+    color: tuple[int, int, int],
+    max_labels: int = 5,
+) -> None:
+    if cv2 is None or not mapped:
+        return
+    preferred = ["nose", "left_hip", "right_hip", "left_shoulder", "right_shoulder"]
+    drawn = 0
+    for name in preferred:
+        if name in mapped and drawn < max_labels:
+            x, y, _ = mapped[name]
+            cv2.putText(
+                frame,
+                f"{name} ({x},{y})",
+                (x + 6, y - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+            drawn += 1
+    if drawn >= max_labels:
+        return
+    for name, (x, y, _) in mapped.items():
+        if name in preferred:
+            continue
+        cv2.putText(
+            frame,
+            f"{name} ({x},{y})",
+            (x + 6, y - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+        drawn += 1
+        if drawn >= max_labels:
+            break
 
 
 def _draw_bbox(frame, bbox_xywh: tuple[int, int, int, int], color: tuple[int, int, int]) -> None:
@@ -888,10 +994,19 @@ def export_overlay_video(
     start_time = time.time()
     _update_info(info_callback, {"stage": "Rendering overlay"})
     primary_track_id = _select_primary_track(tracks, width, height)
+    debug_transform = None
+    if primary_track_id and primary_track_id in track_transforms:
+        debug_transform = track_transforms[primary_track_id]
+    elif track_transforms:
+        debug_transform = next(iter(track_transforms.values()))
+    else:
+        debug_transform = _build_transform({"source": {}}, width, height)
     smoothing_alpha = min(max(smoothing_alpha, 0.0), 1.0)
     smoothed_cache: dict[str, dict[str, tuple[float, float, float]]] = {}
     logged_keypoints = False
     logged_mapping_warning = False
+    if debug_overlay:
+        logging.info("Debug overlay enabled: capture a screenshot to validate mapping primitives.")
     while True:
         if cancel_event is not None and getattr(cancel_event, "is_set")():
             cap.release()
@@ -909,6 +1024,7 @@ def export_overlay_video(
             frames_with_multiple += 1
         _draw_watermark(annotated, frame_index, fps)
         if debug_overlay:
+            _draw_debug_regions(annotated, debug_transform, width, height)
             _draw_debug_corners(annotated, width, height)
         if not frame_entries:
             _draw_no_pose(annotated)
@@ -958,6 +1074,8 @@ def export_overlay_video(
                         )
                         _update_info(info_callback, {"mapping_warning": True})
                         logged_mapping_warning = True
+                if debug_overlay:
+                    _draw_keypoint_labels(annotated, mapped, color)
                 if not logged_keypoints and frame_index == 0:
                     sample = list(mapped.items())[:3]
                     logging.info("First frame keypoints (converted) track=%s sample=%s", track_id, sample)

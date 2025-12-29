@@ -202,6 +202,7 @@ def main() -> None:
     save_pose_var = BooleanVar(value=True)
     save_thumbnails_var = BooleanVar(value=False)
     save_background_var = BooleanVar(value=True)
+    debug_overlay_var = BooleanVar(value=False)
     draw_all_tracks_var = BooleanVar(value=False)
     foreground_mode_var = StringVar(value="Auto (closest/most active)")
     manual_tracks_var = StringVar(value="")
@@ -382,14 +383,20 @@ def main() -> None:
 
     export_overlay_check = ttk.Checkbutton(settings_group, text="Export overlay video (MP4)", variable=export_overlay_var)
     export_overlay_check.grid(row=0, column=0, sticky="w")
+    debug_overlay_check = ttk.Checkbutton(
+        settings_group,
+        text="Debug overlay (mapping primitives)",
+        variable=debug_overlay_var,
+    )
+    debug_overlay_check.grid(row=1, column=0, sticky="w")
     draw_all_tracks_check = ttk.Checkbutton(
         settings_group,
         text="Draw all tracks (debug)",
         variable=draw_all_tracks_var,
     )
-    draw_all_tracks_check.grid(row=1, column=0, sticky="w")
+    draw_all_tracks_check.grid(row=2, column=0, sticky="w")
 
-    ttk.Label(settings_group, text="Tracking backend").grid(row=2, column=0, sticky="w", pady=(8, 2))
+    ttk.Label(settings_group, text="Tracking backend").grid(row=3, column=0, sticky="w", pady=(8, 2))
     backend_combo = ttk.Combobox(
         settings_group,
         textvariable=tracking_backend_var,
@@ -399,9 +406,9 @@ def main() -> None:
         ],
         state="readonly",
     )
-    backend_combo.grid(row=3, column=0, sticky="ew")
+    backend_combo.grid(row=4, column=0, sticky="ew")
 
-    ttk.Label(settings_group, text="Foreground selection mode").grid(row=4, column=0, sticky="w", pady=(8, 2))
+    ttk.Label(settings_group, text="Foreground selection mode").grid(row=5, column=0, sticky="w", pady=(8, 2))
     mode_combo = ttk.Combobox(
         settings_group,
         textvariable=foreground_mode_var,
@@ -412,19 +419,19 @@ def main() -> None:
         ],
         state="readonly",
     )
-    mode_combo.grid(row=5, column=0, sticky="ew")
+    mode_combo.grid(row=6, column=0, sticky="ew")
 
-    ttk.Label(settings_group, text="Manual track IDs (comma-separated)").grid(row=6, column=0, sticky="w", pady=(8, 2))
+    ttk.Label(settings_group, text="Manual track IDs (comma-separated)").grid(row=7, column=0, sticky="w", pady=(8, 2))
     manual_entry = ttk.Entry(settings_group, textvariable=manual_tracks_var)
-    manual_entry.grid(row=7, column=0, sticky="ew")
+    manual_entry.grid(row=8, column=0, sticky="ew")
 
-    ttk.Label(settings_group, text="Smoothing (higher = steadier)").grid(row=8, column=0, sticky="w", pady=(8, 2))
+    ttk.Label(settings_group, text="Smoothing (higher = steadier)").grid(row=9, column=0, sticky="w", pady=(8, 2))
     smoothing_scale = ttk.Scale(settings_group, from_=0.0, to=1.0, variable=smoothing_alpha_var)
-    smoothing_scale.grid(row=9, column=0, sticky="ew")
+    smoothing_scale.grid(row=10, column=0, sticky="ew")
 
-    ttk.Label(settings_group, text="Min keypoint confidence").grid(row=10, column=0, sticky="w", pady=(8, 2))
+    ttk.Label(settings_group, text="Min keypoint confidence").grid(row=11, column=0, sticky="w", pady=(8, 2))
     conf_scale = ttk.Scale(settings_group, from_=0.0, to=1.0, variable=min_conf_var)
-    conf_scale.grid(row=11, column=0, sticky="ew")
+    conf_scale.grid(row=12, column=0, sticky="ew")
 
     update_group = ttk.LabelFrame(settings_tab, text="Updates", padding=12)
     update_group.grid(row=1, column=0, sticky="ew", pady=(12, 0))
@@ -461,6 +468,7 @@ def main() -> None:
             save_thumbnails_check,
             save_background_check,
             export_overlay_check,
+            debug_overlay_check,
             draw_all_tracks_check,
             backend_combo,
             mode_combo,
@@ -576,6 +584,7 @@ def main() -> None:
                     save_thumbnails=save_thumbnails_var.get(),
                     save_background_tracks=save_background_var.get(),
                     foreground_mode=mode,
+                    debug_overlay=debug_overlay_var.get(),
                     draw_all_tracks=draw_all_tracks_var.get(),
                     smoothing_alpha=float(smoothing_alpha_var.get()),
                     min_keypoint_confidence=float(min_conf_var.get()),
