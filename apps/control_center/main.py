@@ -8,7 +8,7 @@ import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
-from tkinter import BooleanVar, StringVar, Text, Tk, filedialog, messagebox, ttk
+from tkinter import BooleanVar, DoubleVar, StringVar, Text, Tk, filedialog, messagebox, ttk
 
 from core.paths import (
     get_app_root,
@@ -191,6 +191,10 @@ def main() -> None:
     save_background_var = BooleanVar(value=True)
     draw_all_tracks_var = BooleanVar(value=False)
     foreground_mode_var = StringVar(value="Auto (closest/most active)")
+    manual_tracks_var = StringVar(value="")
+    smoothing_alpha_var = DoubleVar(value=0.7)
+    min_conf_var = DoubleVar(value=0.2)
+    tracking_backend_var = StringVar(value="Motion (fast)")
 
     cancel_event = threading.Event()
 
@@ -362,7 +366,19 @@ def main() -> None:
     )
     draw_all_tracks_check.grid(row=1, column=0, sticky="w")
 
-    ttk.Label(settings_group, text="Foreground selection mode").grid(row=2, column=0, sticky="w", pady=(8, 2))
+    ttk.Label(settings_group, text="Tracking backend").grid(row=2, column=0, sticky="w", pady=(8, 2))
+    backend_combo = ttk.Combobox(
+        settings_group,
+        textvariable=tracking_backend_var,
+        values=[
+            "Motion (fast)",
+            "Synthetic (demo)",
+        ],
+        state="readonly",
+    )
+    backend_combo.grid(row=3, column=0, sticky="ew")
+
+    ttk.Label(settings_group, text="Foreground selection mode").grid(row=4, column=0, sticky="w", pady=(8, 2))
     mode_combo = ttk.Combobox(
         settings_group,
         textvariable=foreground_mode_var,
@@ -373,7 +389,19 @@ def main() -> None:
         ],
         state="readonly",
     )
-    mode_combo.grid(row=3, column=0, sticky="ew")
+    mode_combo.grid(row=5, column=0, sticky="ew")
+
+    ttk.Label(settings_group, text="Manual track IDs (comma-separated)").grid(row=6, column=0, sticky="w", pady=(8, 2))
+    manual_entry = ttk.Entry(settings_group, textvariable=manual_tracks_var)
+    manual_entry.grid(row=7, column=0, sticky="ew")
+
+    ttk.Label(settings_group, text="Smoothing (higher = steadier)").grid(row=8, column=0, sticky="w", pady=(8, 2))
+    smoothing_scale = ttk.Scale(settings_group, from_=0.0, to=1.0, variable=smoothing_alpha_var)
+    smoothing_scale.grid(row=9, column=0, sticky="ew")
+
+    ttk.Label(settings_group, text="Min keypoint confidence").grid(row=10, column=0, sticky="w", pady=(8, 2))
+    conf_scale = ttk.Scale(settings_group, from_=0.0, to=1.0, variable=min_conf_var)
+    conf_scale.grid(row=11, column=0, sticky="ew")
 
     update_group = ttk.LabelFrame(settings_tab, text="Updates", padding=12)
     update_group.grid(row=1, column=0, sticky="ew", pady=(12, 0))
@@ -411,7 +439,11 @@ def main() -> None:
             save_background_check,
             export_overlay_check,
             draw_all_tracks_check,
+            backend_combo,
             mode_combo,
+            manual_entry,
+            smoothing_scale,
+            conf_scale,
         ]
     )
 
@@ -477,14 +509,23 @@ def main() -> None:
             try:
                 mode = foreground_mode_var.get()
                 if mode != "Auto (closest/most active)":
-                    logging.info("Foreground mode '%s' not implemented yet; using Auto.", mode)
+                    logging.info("Foreground mode: %s", mode)
+                manual_ids = [chunk.strip() for chunk in manual_tracks_var.get().split(",") if chunk.strip()]
+                if mode == "Manual pick" and not manual_ids:
+                    root.after(0, messagebox.showwarning, "Run Overlay", "Enter track IDs for Manual pick mode.")
+                    root.after(0, set_running, False)
+                    return
                 options = ProcessingOptions(
                     export_overlay_video=export_overlay_var.get(),
                     save_pose_json=save_pose_var.get(),
                     save_thumbnails=save_thumbnails_var.get(),
                     save_background_tracks=save_background_var.get(),
-                    foreground_mode="Auto (closest/most active)",
+                    foreground_mode=mode,
                     draw_all_tracks=draw_all_tracks_var.get(),
+                    smoothing_alpha=float(smoothing_alpha_var.get()),
+                    min_keypoint_confidence=float(min_conf_var.get()),
+                    tracking_backend=tracking_backend_var.get(),
+                    manual_track_ids=manual_ids,
                 )
                 pose_path = run_pipeline(
                     Path(selected_video.get()),
