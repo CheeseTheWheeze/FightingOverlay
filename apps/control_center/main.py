@@ -569,9 +569,9 @@ def main() -> None:
     )
     meta.grid(row=1, column=0, sticky="w", pady=(4, 16))
 
+    notebook = ttk.Notebook(container)
     paned_main = ttk.Panedwindow(container, orient="vertical")
     paned_main.grid(row=2, column=0, sticky="nsew")
-    notebook = ttk.Notebook(paned_main)
     paned_main.add(notebook, weight=4)
 
     run_tab, run_content = create_scrollable_tab(notebook, theme)
@@ -1612,7 +1612,7 @@ def main() -> None:
         pady=(6, 0),
     )
 
-    log_frame = ttk.LabelFrame(paned_main, text="Logs", padding=8)
+    log_frame = ttk.LabelFrame(container, text="Logs", padding=8)
     log_frame.columnconfigure(0, weight=1)
     log_frame.rowconfigure(0, weight=1)
 
