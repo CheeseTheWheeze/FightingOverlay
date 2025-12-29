@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from statistics import median
+from statistics import median as stats_median
 from typing import Iterable
 
 from core.schema import KEYPOINT_NAMES
@@ -127,7 +127,7 @@ def _limb_length_ratio(named: dict[str, tuple[float, float, float]], min_confide
         lengths.append(math.hypot(left_pt[0] - right_pt[0], left_pt[1] - right_pt[1]))
     if not lengths:
         return None
-    median_value = float(median(lengths))
+    median_value = float(stats_median(lengths))
     if median_value <= 0:
         return None
     return median_value
@@ -190,14 +190,14 @@ def compute_metrics(
 
     for track_id, values in limb_values.items():
         if values:
-            limb_medians[track_id] = float(median(values))
+            limb_medians[track_id] = float(stats_median(values))
 
     updated: list[FrameMetrics] = []
     for entry in metrics:
-        median = limb_medians.get(entry.track_id)
+        limb_median = limb_medians.get(entry.track_id)
         limb_ratio = None
-        if median and median > 0 and entry.limb_length_px is not None:
-            limb_ratio = entry.limb_length_px / median
+        if limb_median and limb_median > 0 and entry.limb_length_px is not None:
+            limb_ratio = entry.limb_length_px / limb_median
         updated.append(
             FrameMetrics(
                 frame_index=entry.frame_index,

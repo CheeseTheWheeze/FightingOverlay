@@ -40,6 +40,14 @@ def get_models_root() -> Path:
     return get_data_root() / "models"
 
 
+def get_codex_packets_root() -> Path:
+    return get_data_root() / "pending_codex_packets"
+
+
+def get_sent_codex_packets_root() -> Path:
+    return get_data_root() / "sent_codex_packets"
+
+
 def get_versions_root() -> Path:
     return get_app_root() / "versions"
 
