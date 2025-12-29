@@ -23,6 +23,7 @@ def evaluate_pose_payload(payload: dict[str, Any]) -> dict[str, Any]:
     video = payload.get("video", {})
     width = int(video.get("width", 0) or 0)
     height = int(video.get("height", 0) or 0)
+    total_frames = int(video.get("frame_count", 0) or 0)
     tracks = payload.get("tracks", [])
     total_keypoints = 0
     out_of_bounds = 0
@@ -31,6 +32,7 @@ def evaluate_pose_payload(payload: dict[str, Any]) -> dict[str, Any]:
     track_lengths = []
     jitter_values = []
     invalid_tracks = []
+    frame_presence: dict[int, int] = {}
 
     for track in tracks:
         frames = track.get("frames", [])
@@ -45,6 +47,9 @@ def evaluate_pose_payload(payload: dict[str, Any]) -> dict[str, Any]:
         prev_center = None
         for frame in frames:
             keypoints = frame.get("keypoints_2d", [])
+            frame_index = int(frame.get("frame_index", -1))
+            if frame_index >= 0:
+                frame_presence[frame_index] = frame_presence.get(frame_index, 0) + 1
             try:
                 mapped, _, _, _, normalized = _convert_keypoints(keypoints, transform)
             except ValueError as exc:
@@ -67,6 +72,11 @@ def evaluate_pose_payload(payload: dict[str, Any]) -> dict[str, Any]:
     avg_track_length = sum(track_lengths) / len(track_lengths) if track_lengths else 0.0
     jitter = sum(jitter_values) / len(jitter_values) if jitter_values else 0.0
     out_of_bounds_pct = (out_of_bounds / total_keypoints * 100.0) if total_keypoints else 0.0
+    if total_frames <= 0 and frame_presence:
+        total_frames = max(frame_presence.keys()) + 1
+    frames_with_pose = sum(1 for count in frame_presence.values() if count >= 1)
+    frames_with_multiple = sum(1 for count in frame_presence.values() if count >= 2)
+    pose_ratio = frames_with_pose / total_frames if total_frames > 0 else 0.0
 
     return {
         "video": {
@@ -74,11 +84,18 @@ def evaluate_pose_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "width": width,
             "height": height,
             "fps": float(video.get("fps", 0.0) or 0.0),
+            "frame_count": total_frames,
         },
         "tracks": {
             "count": len(tracks),
             "invalid_tracks": invalid_tracks,
             "avg_track_length": avg_track_length,
+        },
+        "frames": {
+            "total": total_frames,
+            "with_pose": frames_with_pose,
+            "with_multiple": frames_with_multiple,
+            "pose_ratio": pose_ratio,
         },
         "keypoints": {
             "total": total_keypoints,
@@ -103,6 +120,8 @@ def write_evaluation_report(payload: dict[str, Any]) -> tuple[Path, Path, dict[s
         "Evaluation Summary\n"
         f"- Tracks: {results['tracks']['count']}\n"
         f"- Avg track length: {results['tracks']['avg_track_length']:.1f} frames\n"
+        f"- Frames with pose >=1: {results['frames']['with_pose']}/{results['frames']['total']}\n"
+        f"- Frames with pose >=2: {results['frames']['with_multiple']}/{results['frames']['total']}\n"
         f"- Out-of-bounds keypoints: {results['keypoints']['out_of_bounds_pct']:.1f}%\n"
         f"- Avg keypoint confidence: {results['keypoints']['avg_confidence']:.2f}\n"
         f"- Center-of-mass jitter: {results['jitter']['center_of_mass_avg_px']:.2f}px\n"
