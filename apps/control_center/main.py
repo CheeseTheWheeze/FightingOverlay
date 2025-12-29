@@ -12,7 +12,20 @@ import urllib.request
 import webbrowser
 from datetime import datetime
 from pathlib import Path
-from tkinter import BooleanVar, Canvas, DoubleVar, IntVar, PhotoImage, StringVar, Text, Tk, filedialog, messagebox, ttk
+from tkinter import (
+    BooleanVar,
+    Canvas,
+    DoubleVar,
+    IntVar,
+    Listbox,
+    PhotoImage,
+    StringVar,
+    Text,
+    Tk,
+    filedialog,
+    messagebox,
+    ttk,
+)
 import tkinter.font as tkfont
 
 import cv2  # type: ignore
@@ -36,6 +49,7 @@ OVERLAY_OPTIONS = {
     "Skeleton overlay": {"slug": "skeleton", "file": "overlay_skeleton.mp4"},
     "Joints-only overlay": {"slug": "joints", "file": "overlay_joints.mp4"},
     "Balance overlay": {"slug": "balance", "file": "overlay_balance.mp4"},
+    "Combat overlay": {"slug": "combat", "file": "overlay_combat.mp4"},
     "Debug overlay": {"slug": "debug", "file": "overlay_debug.mp4"},
 }
 
@@ -48,6 +62,27 @@ class TkTextHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         msg = self.format(record)
+        self.root.after(0, self._append, msg)
+
+    def _append(self, msg: str) -> None:
+        self.text_widget.configure(state="normal")
+        self.text_widget.insert("end", msg + "\n")
+        self.text_widget.see("end")
+        self.text_widget.configure(state="disabled")
+
+
+class FilteredTkTextHandler(logging.Handler):
+    def __init__(self, text_widget: Text, root: Tk, filter_var: StringVar) -> None:
+        super().__init__()
+        self.text_widget = text_widget
+        self.root = root
+        self.filter_var = filter_var
+
+    def emit(self, record: logging.LogRecord) -> None:
+        msg = self.format(record)
+        filter_value = self.filter_var.get().strip()
+        if filter_value and filter_value.lower() not in msg.lower():
+            return
         self.root.after(0, self._append, msg)
 
     def _append(self, msg: str) -> None:
@@ -97,6 +132,13 @@ def get_current_version() -> str:
 
 def open_folder(path: Path) -> None:
     subprocess.run(["explorer", str(path)], check=False)
+
+
+def open_path(path: Path) -> None:
+    if path.is_dir():
+        open_folder(path)
+    else:
+        subprocess.run(["explorer", str(path)], check=False)
 
 
 def fetch_latest_release() -> dict:
@@ -288,6 +330,31 @@ def create_scrollable_tab(parent: ttk.Notebook, theme: dict[str, str]) -> tuple[
     return tab, content
 
 
+def create_scrollable_panel(parent: ttk.Frame, theme: dict[str, str]) -> tuple[ttk.Frame, ttk.Frame]:
+    panel = ttk.Frame(parent, style="Card.TFrame")
+    panel.rowconfigure(0, weight=1)
+    panel.columnconfigure(0, weight=1)
+
+    canvas = Canvas(panel, highlightthickness=0, bd=0, background=theme["surface"])
+    scrollbar = ttk.Scrollbar(panel, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.grid(row=0, column=0, sticky="nsew")
+    scrollbar.grid(row=0, column=1, sticky="ns")
+
+    content = ttk.Frame(canvas, padding=12, style="Card.TFrame")
+    window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+    def _on_content_configure(_event: object) -> None:
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _on_canvas_configure(event: object) -> None:
+        canvas.itemconfigure(window_id, width=event.width)
+
+    content.bind("<Configure>", _on_content_configure)
+    canvas.bind("<Configure>", _on_canvas_configure)
+    return panel, content
+
+
 def format_duration(seconds: float) -> str:
     total = max(0, int(seconds))
     hours = total // 3600
@@ -318,8 +385,10 @@ def main() -> None:
         "run_evaluation": False,
         "export_overlay": True,
         "save_pose_json": True,
+        "save_combat_overlay": False,
         "save_thumbnails": False,
         "save_background_tracks": True,
+        "run_judge": False,
         "tracking_backend": "Motion (fast)",
         "foreground_mode": "Auto (closest/most active)",
         "manual_track_ids": "",
@@ -379,6 +448,7 @@ def main() -> None:
 
     export_overlay_var = BooleanVar(value=bool(settings.get("export_overlay")))
     save_pose_var = BooleanVar(value=bool(settings.get("save_pose_json")))
+    save_combat_var = BooleanVar(value=bool(settings.get("save_combat_overlay")))
     save_thumbnails_var = BooleanVar(value=bool(settings.get("save_thumbnails")))
     save_background_var = BooleanVar(value=bool(settings.get("save_background_tracks")))
     debug_overlay_var = BooleanVar(value=bool(settings.get("debug_overlay")))
@@ -388,6 +458,7 @@ def main() -> None:
     track_sort_var = StringVar(value=str(settings.get("track_sort")))
     live_preview_var = BooleanVar(value=bool(settings.get("live_preview")))
     run_evaluation_var = BooleanVar(value=bool(settings.get("run_evaluation")))
+    run_judge_var = BooleanVar(value=bool(settings.get("run_judge")))
     smoothing_enabled_var = BooleanVar(value=bool(settings.get("smoothing_enabled")))
     foreground_mode_var = StringVar(value=str(settings.get("foreground_mode")))
     manual_tracks_var = StringVar(value=str(settings.get("manual_track_ids")))
@@ -425,10 +496,14 @@ def main() -> None:
     run_tab, run_content = create_scrollable_tab(notebook, theme)
     data_tab, data_content = create_scrollable_tab(notebook, theme)
     settings_tab, settings_content = create_scrollable_tab(notebook, theme)
+    dev_tab = ttk.Frame(notebook, style="Card.TFrame")
+    dev_tab.rowconfigure(0, weight=1)
+    dev_tab.columnconfigure(0, weight=1)
 
     notebook.add(run_tab, text="Run / Processing")
     notebook.add(data_tab, text="Data & Storage")
     notebook.add(settings_tab, text="Settings")
+    notebook.add(dev_tab, text="Dev Mode")
 
     last_tab = settings.get("last_selected_tab")
     if last_tab:
@@ -469,6 +544,140 @@ def main() -> None:
 
     def on_open_logs() -> None:
         open_folder(get_log_root())
+
+    dev_log_filter_var = StringVar(value="")
+    dev_judge_report_var = StringVar(value="Judge report: --")
+    dev_bundle_var = StringVar(value="Bundle: --")
+    dev_artifacts_list: Listbox | None = None
+    dev_judge_state = {"report_path": None}
+
+    def refresh_artifacts() -> None:
+        nonlocal dev_artifacts_list
+        if dev_artifacts_list is None:
+            return
+        output_root = get_outputs_root()
+        entries = []
+        if output_root.exists():
+            entries = sorted([path.name for path in output_root.iterdir()])
+        dev_artifacts_list.delete(0, "end")
+        for entry in entries:
+            dev_artifacts_list.insert("end", entry)
+
+    def open_selected_artifact() -> None:
+        if dev_artifacts_list is None:
+            return
+        selection = dev_artifacts_list.curselection()
+        if not selection:
+            return
+        output_root = get_outputs_root()
+        name = dev_artifacts_list.get(selection[0])
+        open_path(output_root / name)
+
+    def open_judge_report() -> None:
+        report_path = dev_judge_state.get("report_path")
+        if report_path:
+            open_path(Path(report_path))
+
+    dev_pane = ttk.Panedwindow(dev_tab, orient="horizontal")
+    dev_pane.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+
+    dev_left_panel, dev_left_content = create_scrollable_panel(dev_pane, theme)
+    dev_center_panel, dev_center_content = create_scrollable_panel(dev_pane, theme)
+    dev_right_panel, dev_right_content = create_scrollable_panel(dev_pane, theme)
+
+    dev_pane.add(dev_left_panel, weight=1)
+    dev_pane.add(dev_center_panel, weight=2)
+    dev_pane.add(dev_right_panel, weight=1)
+
+    ttk.Label(dev_left_content, text="Inputs & Run", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(dev_left_content, textvariable=selected_video, style="Card.TLabel").grid(
+        row=1, column=0, sticky="w", pady=(4, 8)
+    )
+    dev_left_actions = ttk.Frame(dev_left_content)
+    dev_left_actions.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+    dev_left_actions.columnconfigure(0, weight=1)
+    dev_left_actions.columnconfigure(1, weight=1)
+    dev_open_button = ttk.Button(dev_left_actions, text="Open Video", command=on_open_video)
+    dev_run_button = ttk.Button(dev_left_actions, text="Run Overlay", command=lambda: on_run_overlay())
+    dev_open_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    dev_run_button.grid(row=0, column=1, sticky="ew")
+    dev_cancel_button = ttk.Button(dev_left_content, text="Cancel", command=lambda: cancel_event.set())
+    dev_cancel_button.grid(row=3, column=0, sticky="w", pady=(0, 12))
+
+    ttk.Label(dev_left_content, text="Overlay mode", style="Card.TLabel").grid(row=4, column=0, sticky="w")
+    dev_overlay_combo = ttk.Combobox(
+        dev_left_content,
+        textvariable=overlay_mode_var,
+        values=list(OVERLAY_OPTIONS.keys()),
+        state="readonly",
+    )
+    dev_overlay_combo.grid(row=5, column=0, sticky="ew")
+    dev_save_combat_check = ttk.Checkbutton(
+        dev_left_content,
+        text="Save combat overlay JSON",
+        variable=save_combat_var,
+    )
+    dev_save_combat_check.grid(row=6, column=0, sticky="w")
+    dev_run_judge_check = ttk.Checkbutton(
+        dev_left_content,
+        text="Run alignment judge after processing",
+        variable=run_judge_var,
+    )
+    dev_run_judge_check.grid(row=7, column=0, sticky="w")
+
+    ttk.Label(dev_center_content, text="Live Logs", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(dev_center_content, text="Filter", style="Card.TLabel").grid(row=1, column=0, sticky="w")
+    dev_filter_entry = ttk.Entry(dev_center_content, textvariable=dev_log_filter_var)
+    dev_filter_entry.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+    dev_center_content.columnconfigure(0, weight=1)
+
+    dev_log_frame = ttk.Frame(dev_center_content, style="Card.TFrame")
+    dev_log_frame.grid(row=3, column=0, sticky="nsew")
+    dev_log_frame.columnconfigure(0, weight=1)
+    dev_log_frame.rowconfigure(0, weight=1)
+    dev_log_text = Text(dev_log_frame, height=18, bg="#0f1216", fg="#e7e9ee", relief="flat", font=base_font)
+    dev_log_text.configure(state="disabled")
+    dev_log_text.grid(row=0, column=0, sticky="nsew")
+    dev_log_scroll = ttk.Scrollbar(dev_log_frame, command=dev_log_text.yview)
+    dev_log_scroll.grid(row=0, column=1, sticky="ns")
+    dev_log_text.configure(yscrollcommand=dev_log_scroll.set)
+
+    dev_handler = FilteredTkTextHandler(dev_log_text, root, dev_log_filter_var)
+    dev_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.getLogger().addHandler(dev_handler)
+
+    ttk.Label(dev_right_content, text="Artifacts", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(dev_right_content, textvariable=dev_judge_report_var, style="Card.TLabel").grid(
+        row=1, column=0, sticky="w"
+    )
+    ttk.Label(dev_right_content, textvariable=dev_bundle_var, style="Card.TLabel").grid(row=2, column=0, sticky="w")
+
+    dev_artifacts_frame = ttk.Frame(dev_right_content, style="Card.TFrame")
+    dev_artifacts_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 8))
+    dev_artifacts_frame.columnconfigure(0, weight=1)
+    dev_artifacts_frame.rowconfigure(0, weight=1)
+    dev_artifacts_list = Listbox(dev_artifacts_frame, height=12)
+    dev_artifacts_list.grid(row=0, column=0, sticky="nsew")
+    dev_artifacts_scroll = ttk.Scrollbar(dev_artifacts_frame, command=dev_artifacts_list.yview)
+    dev_artifacts_scroll.grid(row=0, column=1, sticky="ns")
+    dev_artifacts_list.configure(yscrollcommand=dev_artifacts_scroll.set)
+
+    dev_artifacts_actions = ttk.Frame(dev_right_content)
+    dev_artifacts_actions.grid(row=4, column=0, sticky="ew")
+    dev_refresh_button = ttk.Button(dev_artifacts_actions, text="Refresh", command=refresh_artifacts)
+    dev_open_outputs_button = ttk.Button(dev_artifacts_actions, text="Open Outputs", command=on_open_outputs)
+    dev_open_selected_button = ttk.Button(dev_artifacts_actions, text="Open Selected", command=open_selected_artifact)
+    dev_open_report_button = ttk.Button(dev_artifacts_actions, text="Open Judge Report", command=open_judge_report)
+    dev_refresh_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    dev_open_outputs_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+    dev_open_selected_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
+    dev_open_report_button.grid(row=0, column=3, sticky="ew")
+    dev_artifacts_actions.columnconfigure(0, weight=1)
+    dev_artifacts_actions.columnconfigure(1, weight=1)
+    dev_artifacts_actions.columnconfigure(2, weight=1)
+    dev_artifacts_actions.columnconfigure(3, weight=1)
+
+    refresh_artifacts()
 
     def overlay_slug(label: str) -> str:
         return OVERLAY_OPTIONS.get(label, OVERLAY_OPTIONS["Skeleton overlay"])["slug"]
@@ -667,7 +876,7 @@ def main() -> None:
     cancel_button = ttk.Button(run_actions, text="Cancel", command=lambda: cancel_event.set())
     cancel_button.grid(row=1, column=1, sticky="e", pady=(6, 0))
 
-    action_buttons.extend([open_button, run_button, advanced_toggle])
+    action_buttons.extend([open_button, run_button, advanced_toggle, dev_open_button, dev_run_button])
 
     advanced_frame = ttk.Frame(run_content, padding=12, style="Card.TFrame")
     advanced_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 12))
@@ -701,66 +910,79 @@ def main() -> None:
     )
     save_background_check.grid(row=2, column=1, sticky="w")
 
+    save_combat_check = ttk.Checkbutton(
+        advanced_frame,
+        text="Save combat overlay JSON",
+        variable=save_combat_var,
+    )
+    save_combat_check.grid(row=3, column=0, sticky="w")
+    run_judge_check = ttk.Checkbutton(
+        advanced_frame,
+        text="Run alignment judge after processing",
+        variable=run_judge_var,
+    )
+    run_judge_check.grid(row=3, column=1, sticky="w")
+
     debug_overlay_check = ttk.Checkbutton(
         advanced_frame,
         text="Debug overlay (mapping primitives)",
         variable=debug_overlay_var,
     )
-    debug_overlay_check.grid(row=3, column=0, sticky="w")
+    debug_overlay_check.grid(row=4, column=0, sticky="w")
     draw_all_tracks_check = ttk.Checkbutton(
         advanced_frame,
         text="Draw all tracks (debug)",
         variable=draw_all_tracks_var,
     )
-    draw_all_tracks_check.grid(row=3, column=1, sticky="w")
+    draw_all_tracks_check.grid(row=4, column=1, sticky="w")
 
     draw_all_warning = ttk.Label(
         advanced_frame,
         text="All-tracks view can look cluttered; use Joints-only or lower the Top-N cap.",
         style="Card.TLabel",
     )
-    draw_all_warning.grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 6))
+    draw_all_warning.grid(row=5, column=0, columnspan=2, sticky="w", pady=(2, 6))
 
-    ttk.Label(advanced_frame, text="Overlay mode", style="Card.TLabel").grid(row=5, column=0, sticky="w")
+    ttk.Label(advanced_frame, text="Overlay mode", style="Card.TLabel").grid(row=6, column=0, sticky="w")
     overlay_mode_combo = ttk.Combobox(
         advanced_frame,
         textvariable=overlay_mode_var,
         values=list(OVERLAY_OPTIONS.keys()),
         state="readonly",
     )
-    overlay_mode_combo.grid(row=5, column=1, sticky="ew")
+    overlay_mode_combo.grid(row=6, column=1, sticky="ew")
 
-    ttk.Label(advanced_frame, text="Confidence threshold", style="Card.TLabel").grid(row=6, column=0, sticky="w")
+    ttk.Label(advanced_frame, text="Confidence threshold", style="Card.TLabel").grid(row=7, column=0, sticky="w")
     conf_scale = ttk.Scale(advanced_frame, from_=0.0, to=1.0, variable=min_conf_var)
-    conf_scale.grid(row=6, column=1, sticky="ew")
+    conf_scale.grid(row=7, column=1, sticky="ew")
 
     smoothing_enabled_check = ttk.Checkbutton(
         advanced_frame,
         text="EMA smoothing",
         variable=smoothing_enabled_var,
     )
-    smoothing_enabled_check.grid(row=7, column=0, sticky="w")
+    smoothing_enabled_check.grid(row=8, column=0, sticky="w")
     smoothing_scale = ttk.Scale(advanced_frame, from_=0.0, to=1.0, variable=smoothing_alpha_var)
-    smoothing_scale.grid(row=7, column=1, sticky="ew")
+    smoothing_scale.grid(row=8, column=1, sticky="ew")
 
     ttk.Label(
         advanced_frame,
         text="Top-N tracks cap (debug limiter)",
         style="Card.TLabel",
-    ).grid(row=8, column=0, sticky="w")
+    ).grid(row=9, column=0, sticky="w")
     max_tracks_spin = ttk.Spinbox(advanced_frame, from_=1, to=50, textvariable=max_tracks_var, width=5)
-    max_tracks_spin.grid(row=8, column=1, sticky="w")
+    max_tracks_spin.grid(row=9, column=1, sticky="w")
 
-    ttk.Label(advanced_frame, text="Track ranking", style="Card.TLabel").grid(row=9, column=0, sticky="w")
+    ttk.Label(advanced_frame, text="Track ranking", style="Card.TLabel").grid(row=10, column=0, sticky="w")
     track_sort_combo = ttk.Combobox(
         advanced_frame,
         textvariable=track_sort_var,
         values=["Stability score"],
         state="readonly",
     )
-    track_sort_combo.grid(row=9, column=1, sticky="ew")
+    track_sort_combo.grid(row=10, column=1, sticky="ew")
 
-    ttk.Label(advanced_frame, text="Tracking backend", style="Card.TLabel").grid(row=10, column=0, sticky="w")
+    ttk.Label(advanced_frame, text="Tracking backend", style="Card.TLabel").grid(row=11, column=0, sticky="w")
     backend_combo = ttk.Combobox(
         advanced_frame,
         textvariable=tracking_backend_var,
@@ -770,9 +992,9 @@ def main() -> None:
         ],
         state="readonly",
     )
-    backend_combo.grid(row=10, column=1, sticky="ew")
+    backend_combo.grid(row=11, column=1, sticky="ew")
 
-    ttk.Label(advanced_frame, text="Foreground selection mode", style="Card.TLabel").grid(row=11, column=0, sticky="w")
+    ttk.Label(advanced_frame, text="Foreground selection mode", style="Card.TLabel").grid(row=12, column=0, sticky="w")
     mode_combo = ttk.Combobox(
         advanced_frame,
         textvariable=foreground_mode_var,
@@ -783,29 +1005,29 @@ def main() -> None:
         ],
         state="readonly",
     )
-    mode_combo.grid(row=11, column=1, sticky="ew")
+    mode_combo.grid(row=12, column=1, sticky="ew")
 
     ttk.Label(advanced_frame, text="Manual track IDs (comma-separated)", style="Card.TLabel").grid(
-        row=12, column=0, sticky="w"
+        row=13, column=0, sticky="w"
     )
     manual_entry = ttk.Entry(advanced_frame, textvariable=manual_tracks_var)
-    manual_entry.grid(row=12, column=1, sticky="ew")
+    manual_entry.grid(row=13, column=1, sticky="ew")
 
     live_preview_check = ttk.Checkbutton(
         advanced_frame,
         text="Live preview",
         variable=live_preview_var,
     )
-    live_preview_check.grid(row=13, column=0, sticky="w")
+    live_preview_check.grid(row=14, column=0, sticky="w")
     run_eval_check = ttk.Checkbutton(
         advanced_frame,
         text="Run evaluation after processing",
         variable=run_evaluation_var,
     )
-    run_eval_check.grid(row=13, column=1, sticky="w")
+    run_eval_check.grid(row=14, column=1, sticky="w")
 
     reset_button = ttk.Button(advanced_frame, text="Reset to defaults")
-    reset_button.grid(row=14, column=1, sticky="e", pady=(6, 0))
+    reset_button.grid(row=15, column=1, sticky="e", pady=(6, 0))
 
     quick_actions = ttk.Frame(run_content, padding=8, style="Card.TFrame")
     quick_actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -1093,16 +1315,21 @@ def main() -> None:
     settings_controls.extend(
         [
             save_pose_check,
+            save_combat_check,
             save_thumbnails_check,
             save_background_check,
             export_overlay_check,
             debug_overlay_check,
             draw_all_tracks_check,
             overlay_mode_combo,
+            dev_overlay_combo,
+            dev_save_combat_check,
+            dev_run_judge_check,
             max_tracks_spin,
             track_sort_combo,
             live_preview_check,
             run_eval_check,
+            run_judge_check,
             smoothing_enabled_check,
             backend_combo,
             mode_combo,
@@ -1128,6 +1355,7 @@ def main() -> None:
 
     bind_setting(export_overlay_var, "export_overlay", bool)
     bind_setting(save_pose_var, "save_pose_json", bool)
+    bind_setting(save_combat_var, "save_combat_overlay", bool)
     bind_setting(save_thumbnails_var, "save_thumbnails", bool)
     bind_setting(save_background_var, "save_background_tracks", bool)
     bind_setting(debug_overlay_var, "debug_overlay", bool)
@@ -1137,6 +1365,7 @@ def main() -> None:
     bind_setting(track_sort_var, "track_sort", str)
     bind_setting(live_preview_var, "live_preview", bool)
     bind_setting(run_evaluation_var, "run_evaluation", bool)
+    bind_setting(run_judge_var, "run_judge", bool)
     bind_setting(smoothing_enabled_var, "smoothing_enabled", bool)
     bind_setting(smoothing_alpha_var, "smoothing_alpha", float)
     bind_setting(min_conf_var, "confidence_threshold", float)
@@ -1174,6 +1403,7 @@ def main() -> None:
     def reset_defaults() -> None:
         export_overlay_var.set(defaults["export_overlay"])
         save_pose_var.set(defaults["save_pose_json"])
+        save_combat_var.set(defaults["save_combat_overlay"])
         save_thumbnails_var.set(defaults["save_thumbnails"])
         save_background_var.set(defaults["save_background_tracks"])
         debug_overlay_var.set(defaults["debug_overlay"])
@@ -1183,6 +1413,7 @@ def main() -> None:
         track_sort_var.set(defaults["track_sort"])
         live_preview_var.set(defaults["live_preview"])
         run_evaluation_var.set(defaults["run_evaluation"])
+        run_judge_var.set(defaults["run_judge"])
         smoothing_enabled_var.set(defaults["smoothing_enabled"])
         smoothing_alpha_var.set(defaults["smoothing_alpha"])
         min_conf_var.set(defaults["confidence_threshold"])
@@ -1214,6 +1445,7 @@ def main() -> None:
             else:
                 widget.configure(state=state)
         cancel_button.configure(state="normal" if running else "disabled")
+        dev_cancel_button.configure(state="normal" if running else "disabled")
 
     def update_status(message: str, progress_value: float | None = None) -> None:
         status_var.set(message)
@@ -1267,6 +1499,17 @@ def main() -> None:
             problems_list.delete("1.0", "end")
             problems_list.insert("end", "\n".join(problem_buffer))
             problems_list.configure(state="disabled")
+        if "judge_output" in info:
+            judge_output = info.get("judge_output", {})
+            if isinstance(judge_output, dict):
+                report_path = judge_output.get("report_html")
+                bundle_dir = judge_output.get("bundle_dir")
+                if report_path:
+                    dev_judge_report_var.set(f"Judge report: {report_path}")
+                    dev_judge_state["report_path"] = str(report_path)
+                if bundle_dir:
+                    dev_bundle_var.set(f"Bundle: {bundle_dir}")
+                refresh_artifacts()
         if "problem" in info:
             problem = info.get("problem", {})
             if isinstance(problem, dict):
@@ -1341,6 +1584,7 @@ def main() -> None:
                 options = ProcessingOptions(
                     export_overlay_video=export_overlay_var.get(),
                     save_pose_json=save_pose_var.get(),
+                    save_combat_overlay=save_combat_var.get(),
                     save_thumbnails=save_thumbnails_var.get(),
                     save_background_tracks=save_background_var.get(),
                     foreground_mode=mode,
@@ -1354,6 +1598,7 @@ def main() -> None:
                     track_sort=track_sort,
                     live_preview=live_preview_var.get(),
                     run_evaluation=run_evaluation_var.get(),
+                    run_judge=run_judge_var.get(),
                     tracking_backend=tracking_backend_var.get(),
                     manual_track_ids=manual_ids,
                 )
