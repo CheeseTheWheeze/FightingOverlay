@@ -12,7 +12,8 @@ import urllib.request
 import webbrowser
 from datetime import datetime
 from pathlib import Path
-from tkinter import BooleanVar, DoubleVar, IntVar, PhotoImage, StringVar, Text, Tk, filedialog, messagebox, ttk
+from tkinter import BooleanVar, Canvas, DoubleVar, IntVar, PhotoImage, StringVar, Text, Tk, filedialog, messagebox, ttk
+import tkinter.font as tkfont
 
 import cv2  # type: ignore
 
@@ -189,29 +190,102 @@ def validate_output_schema() -> tuple[bool, str]:
     return validate_pose_tracks_schema(payload)
 
 
-def configure_dark_theme(root: Tk) -> None:
+def configure_dark_theme(root: Tk, scale: float) -> dict[str, str]:
     style = ttk.Style()
     style.theme_use("clam")
     background = "#1c1f24"
     surface = "#252a31"
     accent = "#2f6fed"
     text = "#e7e9ee"
+    base_padding = max(4, int(6 * scale))
+    tab_padding = (max(6, int(12 * scale)), max(4, int(6 * scale)))
 
     root.configure(background=background)
     style.configure("TFrame", background=background)
     style.configure("Card.TFrame", background=surface)
     style.configure("TLabel", background=background, foreground=text)
     style.configure("Card.TLabel", background=surface, foreground=text)
-    style.configure("Header.TLabel", background=background, foreground=text, font=("Segoe UI", 16, "bold"))
-    style.configure("Subheader.TLabel", background=background, foreground=text, font=("Segoe UI", 11, "bold"))
-    style.configure("TButton", background=surface, foreground=text, padding=6)
+    style.configure(
+        "Header.TLabel",
+        background=background,
+        foreground=text,
+        font=("Segoe UI", max(12, int(16 * scale)), "bold"),
+    )
+    style.configure(
+        "Subheader.TLabel",
+        background=background,
+        foreground=text,
+        font=("Segoe UI", max(9, int(11 * scale)), "bold"),
+    )
+    style.configure("TButton", background=surface, foreground=text, padding=base_padding)
     style.map("TButton", background=[("active", "#313740")])
-    style.configure("Accent.TButton", background=accent, foreground="#ffffff", font=("Segoe UI", 10, "bold"))
+    style.configure(
+        "Accent.TButton",
+        background=accent,
+        foreground="#ffffff",
+        font=("Segoe UI", max(9, int(10 * scale)), "bold"),
+    )
     style.map("Accent.TButton", background=[("active", "#3b7bff")])
     style.configure("TNotebook", background=background, borderwidth=0)
-    style.configure("TNotebook.Tab", background=surface, foreground=text, padding=(12, 6))
+    style.configure("TNotebook.Tab", background=surface, foreground=text, padding=tab_padding)
     style.map("TNotebook.Tab", background=[("selected", "#313740")])
     style.configure("TProgressbar", troughcolor=surface, background=accent)
+    return {"background": background, "surface": surface, "accent": accent, "text": text}
+
+
+def get_ui_scale(root: Tk) -> float:
+    width = root.winfo_screenwidth()
+    height = root.winfo_screenheight()
+    scale = min(width / 1280, height / 720)
+    return max(0.85, min(scale, 1.4))
+
+
+def create_scrollable_tab(parent: ttk.Notebook, theme: dict[str, str]) -> tuple[ttk.Frame, ttk.Frame]:
+    tab = ttk.Frame(parent, style="Card.TFrame")
+    tab.rowconfigure(0, weight=1)
+    tab.columnconfigure(0, weight=1)
+
+    canvas = Canvas(tab, highlightthickness=0, bd=0, background=theme["surface"])
+    scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.grid(row=0, column=0, sticky="nsew")
+    scrollbar.grid(row=0, column=1, sticky="ns")
+
+    content = ttk.Frame(canvas, padding=12, style="Card.TFrame")
+    window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+    def _on_content_configure(_event: object) -> None:
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _on_canvas_configure(event: object) -> None:
+        canvas.itemconfigure(window_id, width=event.width)
+
+    def _on_mousewheel(event: object) -> None:
+        if getattr(event, "delta", 0):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        elif getattr(event, "num", 0) == 4:
+            canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", 0) == 5:
+            canvas.yview_scroll(1, "units")
+
+    def _bind_mousewheel(_event: object) -> None:
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", _on_mousewheel)
+        canvas.bind_all("<Button-5>", _on_mousewheel)
+
+    def _unbind_mousewheel(_event: object) -> None:
+        canvas.unbind_all("<MouseWheel>")
+        canvas.unbind_all("<Button-4>")
+        canvas.unbind_all("<Button-5>")
+
+    content.bind("<Configure>", _on_content_configure)
+    canvas.bind("<Configure>", _on_canvas_configure)
+    canvas.bind("<Enter>", _bind_mousewheel)
+    canvas.bind("<Leave>", _unbind_mousewheel)
+    content.bind("<Enter>", _bind_mousewheel)
+    content.bind("<Leave>", _unbind_mousewheel)
+
+    return tab, content
 
 
 def format_duration(seconds: float) -> str:
@@ -270,9 +344,14 @@ def main() -> None:
         return
 
     root = Tk()
-    configure_dark_theme(root)
+    scale = get_ui_scale(root)
+    root.tk.call("tk", "scaling", scale)
+    base_font = tkfont.nametofont("TkDefaultFont")
+    base_font.configure(size=max(9, int(10 * scale)))
+    theme = configure_dark_theme(root, scale)
     root.title("FightingOverlay Control Center")
-    root.geometry("980x720")
+    root.geometry(f"{int(980 * scale)}x{int(720 * scale)}")
+    root.minsize(int(860 * scale), int(620 * scale))
 
     last_video = settings.get("last_video_path") or ""
     selected_video = StringVar(value=last_video if last_video else "No video selected")
@@ -343,9 +422,9 @@ def main() -> None:
     notebook = ttk.Notebook(container)
     notebook.grid(row=2, column=0, sticky="nsew")
 
-    run_tab = ttk.Frame(notebook, padding=12, style="Card.TFrame")
-    data_tab = ttk.Frame(notebook, padding=12, style="Card.TFrame")
-    settings_tab = ttk.Frame(notebook, padding=12, style="Card.TFrame")
+    run_tab, run_content = create_scrollable_tab(notebook, theme)
+    data_tab, data_content = create_scrollable_tab(notebook, theme)
+    settings_tab, settings_content = create_scrollable_tab(notebook, theme)
 
     notebook.add(run_tab, text="Run / Processing")
     notebook.add(data_tab, text="Data & Storage")
@@ -365,12 +444,12 @@ def main() -> None:
 
     notebook.bind("<<NotebookTabChanged>>", on_tab_changed)
 
-    run_tab.columnconfigure(1, weight=1)
-    run_tab.rowconfigure(5, weight=1)
-    run_tab.rowconfigure(6, weight=1)
+    run_content.columnconfigure(1, weight=1)
+    run_content.rowconfigure(5, weight=1)
+    run_content.rowconfigure(6, weight=1)
 
-    ttk.Label(run_tab, text="Source Video", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
-    ttk.Label(run_tab, textvariable=selected_video, style="Card.TLabel").grid(
+    ttk.Label(run_content, text="Source Video", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(run_content, textvariable=selected_video, style="Card.TLabel").grid(
         row=1, column=0, columnspan=2, sticky="w", pady=(4, 12)
     )
 
@@ -559,7 +638,7 @@ def main() -> None:
     install_after_job = {"pending": False}
     processing_state = {"running": False}
 
-    run_actions = ttk.Frame(run_tab)
+    run_actions = ttk.Frame(run_content)
     run_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
     run_actions.columnconfigure(0, weight=1)
     run_actions.columnconfigure(1, weight=1)
@@ -590,7 +669,7 @@ def main() -> None:
 
     action_buttons.extend([open_button, run_button, advanced_toggle])
 
-    advanced_frame = ttk.Frame(run_tab, padding=12, style="Card.TFrame")
+    advanced_frame = ttk.Frame(run_content, padding=12, style="Card.TFrame")
     advanced_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 12))
     advanced_frame.columnconfigure(0, weight=1)
     advanced_frame.columnconfigure(1, weight=1)
@@ -728,7 +807,7 @@ def main() -> None:
     reset_button = ttk.Button(advanced_frame, text="Reset to defaults")
     reset_button.grid(row=14, column=1, sticky="e", pady=(6, 0))
 
-    quick_actions = ttk.Frame(run_tab, padding=8, style="Card.TFrame")
+    quick_actions = ttk.Frame(run_content, padding=8, style="Card.TFrame")
     quick_actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(10, 0))
     quick_actions.columnconfigure(0, weight=1)
     quick_actions.columnconfigure(1, weight=1)
@@ -738,7 +817,7 @@ def main() -> None:
     quick_outputs.grid(row=0, column=0, sticky="ew", padx=(0, 6))
     quick_logs.grid(row=0, column=1, sticky="ew")
 
-    status_frame = ttk.Frame(run_tab, padding=12, style="Card.TFrame")
+    status_frame = ttk.Frame(run_content, padding=12, style="Card.TFrame")
     status_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(16, 8))
     status_frame.columnconfigure(1, weight=1)
 
@@ -783,7 +862,7 @@ def main() -> None:
         row=5, column=0, columnspan=2, sticky="w", pady=(6, 0)
     )
 
-    preview_frame = ttk.Frame(run_tab, padding=12, style="Card.TFrame")
+    preview_frame = ttk.Frame(run_content, padding=12, style="Card.TFrame")
     preview_frame.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
     preview_frame.columnconfigure(0, weight=1)
 
@@ -793,7 +872,7 @@ def main() -> None:
     preview_label = ttk.Label(preview_frame, text="Preview will appear while processing", style="Card.TLabel")
     preview_label.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
 
-    output_frame = ttk.Frame(run_tab, padding=12, style="Card.TFrame")
+    output_frame = ttk.Frame(run_content, padding=12, style="Card.TFrame")
     output_frame.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
     output_frame.columnconfigure(1, weight=1)
 
@@ -903,23 +982,23 @@ def main() -> None:
 
     overlay_mode_var.trace_add("write", lambda *_: load_viewer_video())
 
-    problems_frame = ttk.Frame(run_tab, padding=12, style="Card.TFrame")
+    problems_frame = ttk.Frame(run_content, padding=12, style="Card.TFrame")
     problems_frame.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(0, 8))
     problems_frame.columnconfigure(0, weight=1)
 
     ttk.Label(problems_frame, text="Problems", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
-    problems_list = Text(problems_frame, height=5, bg="#0f1216", fg="#e7e9ee", relief="flat")
+    problems_list = Text(problems_frame, height=5, bg="#0f1216", fg="#e7e9ee", relief="flat", font=base_font)
     problems_list.configure(state="disabled")
     problems_list.grid(row=1, column=0, sticky="ew", pady=(6, 0))
 
-    data_tab.columnconfigure(0, weight=1)
+    data_content.columnconfigure(0, weight=1)
 
-    data_group = ttk.LabelFrame(data_tab, text="Storage", padding=12)
+    data_group = ttk.LabelFrame(data_content, text="Storage", padding=12)
     data_group.grid(row=0, column=0, sticky="ew")
     ttk.Label(data_group, text=f"Outputs: {get_outputs_root()}").grid(row=0, column=0, sticky="w")
     ttk.Label(data_group, text=f"Logs: {get_log_root()}").grid(row=1, column=0, sticky="w")
 
-    data_actions = ttk.Frame(data_tab, padding=12, style="Card.TFrame")
+    data_actions = ttk.Frame(data_content, padding=12, style="Card.TFrame")
     data_actions.grid(row=1, column=0, sticky="ew", pady=(12, 0))
     data_actions.columnconfigure(0, weight=1)
     data_actions.columnconfigure(1, weight=1)
@@ -929,9 +1008,9 @@ def main() -> None:
     outputs_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
     logs_button.grid(row=0, column=1, sticky="ew")
 
-    settings_tab.columnconfigure(0, weight=1)
+    settings_content.columnconfigure(0, weight=1)
 
-    update_group = ttk.LabelFrame(settings_tab, text="Updates", padding=12)
+    update_group = ttk.LabelFrame(settings_content, text="Updates", padding=12)
     update_group.grid(row=0, column=0, sticky="ew")
     update_group.columnconfigure(1, weight=1)
 
@@ -957,7 +1036,7 @@ def main() -> None:
     ttk.Label(update_group, textvariable=update_latest_version_var, style="Card.TLabel").grid(row=4, column=1, sticky="w")
 
     ttk.Label(update_group, text="Release notes", style="Card.TLabel").grid(row=5, column=0, sticky="nw")
-    update_notes_text = Text(update_group, height=6, bg="#0f1216", fg="#e7e9ee", relief="flat")
+    update_notes_text = Text(update_group, height=6, bg="#0f1216", fg="#e7e9ee", relief="flat", font=base_font)
     update_notes_text.grid(row=5, column=1, sticky="ew")
     update_notes_text.configure(state="disabled")
 
@@ -985,7 +1064,7 @@ def main() -> None:
     ttk.Label(update_group, text="Update history (last 5)", style="Card.TLabel").grid(
         row=8, column=0, sticky="nw", pady=(8, 0)
     )
-    update_history_text = Text(update_group, height=5, bg="#0f1216", fg="#e7e9ee", relief="flat")
+    update_history_text = Text(update_group, height=5, bg="#0f1216", fg="#e7e9ee", relief="flat", font=base_font)
     update_history_text.grid(row=8, column=1, sticky="ew", pady=(8, 0))
     update_history_text.configure(state="disabled")
 
@@ -997,7 +1076,7 @@ def main() -> None:
     log_frame.columnconfigure(0, weight=1)
     log_frame.rowconfigure(0, weight=1)
 
-    log_text = Text(log_frame, height=10, bg="#0f1216", fg="#e7e9ee", relief="flat")
+    log_text = Text(log_frame, height=10, bg="#0f1216", fg="#e7e9ee", relief="flat", font=base_font)
     log_text.configure(state="disabled")
     log_text.grid(row=0, column=0, sticky="nsew")
 
@@ -1311,7 +1390,7 @@ def main() -> None:
 
     run_button.configure(command=on_run_overlay)
 
-    validate_button = ttk.Button(run_tab, text="Validate Output JSON schema", command=on_validate)
+    validate_button = ttk.Button(run_content, text="Validate Output JSON schema", command=on_validate)
     validate_button.grid(row=9, column=0, sticky="w", pady=(6, 0))
 
     action_buttons.append(validate_button)
