@@ -454,7 +454,8 @@ def json_dumps(payload: dict[str, object]) -> str:
     return json.dumps(payload, indent=2)
 
 
-_SKELETON_CONNECTIONS = [
+_SKELETON_15_NAMES = KEYPOINT_NAMES
+_SKELETON_15_CONNECTIONS = [
     ("nose", "left_eye"),
     ("nose", "right_eye"),
     ("left_eye", "left_shoulder"),
@@ -473,8 +474,148 @@ _SKELETON_CONNECTIONS = [
     ("right_knee", "right_ankle"),
 ]
 
+_COCO_KEYPOINT_NAMES = [
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
+]
 
-def _normalize_keypoints(keypoints: list[object]) -> list[dict[str, float | str]]:
+_COCO_SKELETON_CONNECTIONS = [
+    ("nose", "left_eye"),
+    ("nose", "right_eye"),
+    ("left_eye", "left_ear"),
+    ("right_eye", "right_ear"),
+    ("left_shoulder", "right_shoulder"),
+    ("left_shoulder", "left_elbow"),
+    ("right_shoulder", "right_elbow"),
+    ("left_elbow", "left_wrist"),
+    ("right_elbow", "right_wrist"),
+    ("left_shoulder", "left_hip"),
+    ("right_shoulder", "right_hip"),
+    ("left_hip", "right_hip"),
+    ("left_hip", "left_knee"),
+    ("right_hip", "right_knee"),
+    ("left_knee", "left_ankle"),
+    ("right_knee", "right_ankle"),
+]
+
+_KEYPOINT_LAYOUTS = {
+    "overlay15": {"count": len(_SKELETON_15_NAMES), "names": _SKELETON_15_NAMES, "skeleton": _SKELETON_15_CONNECTIONS},
+    "coco17": {"count": len(_COCO_KEYPOINT_NAMES), "names": _COCO_KEYPOINT_NAMES, "skeleton": _COCO_SKELETON_CONNECTIONS},
+}
+
+
+def _inspect_keypoints(keypoints: list[object]) -> dict[str, object]:
+    if not isinstance(keypoints, list):
+        raise ValueError("keypoints must be a list.")
+    if not keypoints:
+        return {"count": 0, "stride": 0, "shape": "(0,)", "raw_samples": [], "names_in_data": []}
+    if all(isinstance(item, dict) for item in keypoints):
+        samples = []
+        names = []
+        for idx, item in enumerate(keypoints[:3]):
+            samples.append(
+                {
+                    "idx": idx,
+                    "name": item.get("name"),
+                    "x": item.get("x"),
+                    "y": item.get("y"),
+                    "c": item.get("c", 1.0),
+                }
+            )
+        for item in keypoints:
+            if "name" in item and item.get("name") is not None:
+                names.append(str(item.get("name")))
+        return {
+            "count": len(keypoints),
+            "stride": 3,
+            "shape": f"({len(keypoints)}, dict)",
+            "raw_samples": samples,
+            "names_in_data": names,
+        }
+    if all(isinstance(item, (int, float)) for item in keypoints):
+        flat = [float(item) for item in keypoints]
+        if len(flat) % 3 == 0:
+            stride = 3
+        elif len(flat) % 2 == 0:
+            stride = 2
+        else:
+            raise ValueError("Flat keypoint list must be divisible by 2 or 3.")
+        samples = []
+        for idx in range(0, min(len(flat), stride * 3), stride):
+            kp_index = idx // stride
+            x = flat[idx]
+            y = flat[idx + 1]
+            c = flat[idx + 2] if stride == 3 else 1.0
+            samples.append({"idx": kp_index, "x": x, "y": y, "c": c})
+        return {
+            "count": len(flat) // stride,
+            "stride": stride,
+            "shape": f"({len(flat)},)",
+            "raw_samples": samples,
+            "names_in_data": [],
+        }
+    if all(isinstance(item, (list, tuple)) for item in keypoints):
+        lengths = {len(item) for item in keypoints}
+        if lengths - {2, 3}:
+            raise ValueError("Keypoint rows must have length 2 or 3.")
+        if len(lengths) != 1:
+            raise ValueError("Keypoint rows must be consistently length 2 or 3.")
+        row_len = next(iter(lengths))
+        samples = []
+        for idx, row in enumerate(keypoints[:3]):
+            c = float(row[2]) if row_len == 3 else 1.0
+            samples.append({"idx": idx, "x": row[0], "y": row[1], "c": c})
+        return {
+            "count": len(keypoints),
+            "stride": row_len,
+            "shape": f"({len(keypoints)}, {row_len})",
+            "raw_samples": samples,
+            "names_in_data": [],
+        }
+    raise ValueError("Unsupported keypoint format.")
+
+
+def _resolve_keypoint_layout(keypoint_info: dict[str, object]) -> tuple[str | None, list[str], list[tuple[str, str]]]:
+    count = int(keypoint_info.get("count", 0))
+    names_in_data = keypoint_info.get("names_in_data", [])
+    if (
+        count == _KEYPOINT_LAYOUTS["coco17"]["count"]
+        and names_in_data
+        and (
+            names_in_data == _COCO_KEYPOINT_NAMES
+            or set(names_in_data) == set(_COCO_KEYPOINT_NAMES)
+        )
+    ):
+        layout = _KEYPOINT_LAYOUTS["coco17"]
+        return "coco17", list(layout["names"]), list(layout["skeleton"])
+    if count == _KEYPOINT_LAYOUTS["overlay15"]["count"]:
+        if not names_in_data or (
+            len(names_in_data) == len(_SKELETON_15_NAMES) and set(names_in_data) == set(_SKELETON_15_NAMES)
+        ):
+            layout = _KEYPOINT_LAYOUTS["overlay15"]
+            return "overlay15", list(layout["names"]), list(layout["skeleton"])
+    return None, [f"k{idx}" for idx in range(count)], []
+
+
+def _normalize_keypoints(
+    keypoints: list[object],
+    names: list[str] | None = None,
+) -> list[dict[str, float | str]]:
     """Normalize keypoints into name/x/y/c dicts.
 
     Coordinate convention:
@@ -489,7 +630,7 @@ def _normalize_keypoints(keypoints: list[object]) -> list[dict[str, float | str]
     if all(isinstance(item, dict) for item in keypoints):
         normalized = []
         for idx, item in enumerate(keypoints):
-            fallback = KEYPOINT_NAMES[idx] if idx < len(KEYPOINT_NAMES) else f"k{idx}"
+            fallback = names[idx] if names and idx < len(names) else f"k{idx}"
             name = str(item.get("name") or fallback)
             x = float(item.get("x", 0.0))
             y = float(item.get("y", 0.0))
@@ -507,7 +648,7 @@ def _normalize_keypoints(keypoints: list[object]) -> list[dict[str, float | str]
         normalized = []
         for idx in range(0, len(flat), step):
             kp_index = idx // step
-            name = KEYPOINT_NAMES[kp_index] if kp_index < len(KEYPOINT_NAMES) else f"k{kp_index}"
+            name = names[kp_index] if names and kp_index < len(names) else f"k{kp_index}"
             x = flat[idx]
             y = flat[idx + 1]
             c = flat[idx + 2] if step == 3 else 1.0
@@ -522,7 +663,7 @@ def _normalize_keypoints(keypoints: list[object]) -> list[dict[str, float | str]
         row_len = next(iter(lengths))
         normalized = []
         for idx, row in enumerate(keypoints):
-            name = KEYPOINT_NAMES[idx] if idx < len(KEYPOINT_NAMES) else f"k{idx}"
+            name = names[idx] if names and idx < len(names) else f"k{idx}"
             x = float(row[0])
             y = float(row[1])
             c = float(row[2]) if row_len == 3 else 1.0
@@ -663,13 +804,15 @@ def _convert_xy(x: float, y: float, transform: dict[str, float | str]) -> tuple[
 def _convert_keypoints(
     keypoints: list[object],
     transform: dict[str, float | str],
-) -> dict[str, tuple[int, int, float]]:
-    normalized = _normalize_keypoints(keypoints)
+) -> tuple[dict[str, tuple[int, int, float]], dict[str, object], str | None, list[tuple[str, str]], list[dict[str, float | str]]]:
+    keypoint_info = _inspect_keypoints(keypoints)
+    layout_name, layout_names, skeleton = _resolve_keypoint_layout(keypoint_info)
+    normalized = _normalize_keypoints(keypoints, layout_names)
     mapped: dict[str, tuple[int, int, float]] = {}
     for kp in normalized:
         x, y = _convert_xy(float(kp["x"]), float(kp["y"]), transform)
         mapped[str(kp["name"])] = (int(round(x)), int(round(y)), float(kp["c"]))
-    return mapped
+    return mapped, keypoint_info, layout_name, skeleton, normalized
 
 
 def _convert_bbox(
@@ -873,16 +1016,19 @@ def _draw_pose_overlay(
     frame,
     mapped: dict[str, tuple[int, int, float]],
     color: tuple[int, int, int],
+    skeleton_connections: list[tuple[str, str]],
     min_confidence: float = 0.1,
+    draw_lines: bool = True,
 ) -> None:
     if cv2 is None:
         return
-    for a, b in _SKELETON_CONNECTIONS:
-        if a in mapped and b in mapped:
-            ax, ay, ac = mapped[a]
-            bx, by, bc = mapped[b]
-            if ac > min_confidence and bc > min_confidence:
-                cv2.line(frame, (ax, ay), (bx, by), color, 2)
+    if draw_lines:
+        for a, b in skeleton_connections:
+            if a in mapped and b in mapped:
+                ax, ay, ac = mapped[a]
+                bx, by, bc = mapped[b]
+                if ac > min_confidence and bc > min_confidence:
+                    cv2.line(frame, (ax, ay), (bx, by), color, 2)
     for _, (x, y, conf) in mapped.items():
         if conf > min_confidence:
             cv2.circle(frame, (x, y), 3, color, -1)
@@ -1030,8 +1176,11 @@ def export_overlay_video(
             _draw_no_pose(annotated)
         else:
             colors = [(0, 200, 255), (255, 200, 0), (180, 255, 120), (255, 120, 180)]
+            diagnostic_frame = frame_index == 0 and primary_track_id is not None
             for idx, entry in enumerate(frame_entries):
                 track_id = str(entry.get("track_id", "track"))
+                if diagnostic_frame and track_id != primary_track_id:
+                    continue
                 transform = track_transforms.get(track_id, _build_transform({"source": {}}, width, height))
                 timestamp_ms = float(entry.get("timestamp_ms", 0.0))
                 expected_ts = frame_index / max(1.0, fps) * 1000.0
@@ -1053,10 +1202,17 @@ def export_overlay_video(
                     continue
                 keypoints = entry.get("keypoints_2d", [])
                 try:
-                    mapped = _convert_keypoints(keypoints, transform)
+                    mapped, keypoint_info, layout_name, skeleton, normalized = _convert_keypoints(keypoints, transform)
                 except ValueError as exc:
                     logging.warning("Skipping invalid keypoints for track %s: %s", track_id, exc)
                     continue
+                if layout_name is None and not logged_keypoints:
+                    logging.warning(
+                        "Unknown keypoint layout K=%s shape=%s stride=%s; drawing dots only.",
+                        keypoint_info.get("count"),
+                        keypoint_info.get("shape"),
+                        keypoint_info.get("stride"),
+                    )
                 if mapped:
                     total_kps = len(mapped)
                     out_of_bounds = sum(
@@ -1076,9 +1232,32 @@ def export_overlay_video(
                         logged_mapping_warning = True
                 if debug_overlay:
                     _draw_keypoint_labels(annotated, mapped, color)
-                if not logged_keypoints and frame_index == 0:
-                    sample = list(mapped.items())[:3]
-                    logging.info("First frame keypoints (converted) track=%s sample=%s", track_id, sample)
+                if not logged_keypoints and diagnostic_frame:
+                    raw_samples = []
+                    for idx, kp in enumerate(normalized[:3]):
+                        name = kp.get("name", f"k{idx}")
+                        mapped_sample = mapped.get(str(name))
+                        raw_samples.append(
+                            {
+                                "idx": idx,
+                                "name": name,
+                                "raw": (kp.get("x"), kp.get("y"), kp.get("c")),
+                                "mapped": mapped_sample,
+                            }
+                        )
+                    logging.info(
+                        (
+                            "Diagnostic keypoints frame=%s track=%s K=%s shape=%s stride=%s "
+                            "layout=%s raw_mapped_samples=%s"
+                        ),
+                        frame_index,
+                        track_id,
+                        keypoint_info.get("count"),
+                        keypoint_info.get("shape"),
+                        keypoint_info.get("stride"),
+                        layout_name,
+                        raw_samples,
+                    )
                     logged_keypoints = True
                 smoothed_track = smoothed_cache.setdefault(track_id, {})
                 smoothed_mapped: dict[str, tuple[int, int, float]] = {}
@@ -1092,7 +1271,24 @@ def export_overlay_video(
                         conf = smoothing_alpha * conf + (1 - smoothing_alpha) * prev_c
                     smoothed_track[name] = (x, y, conf)
                     smoothed_mapped[name] = (int(round(x)), int(round(y)), conf)
-                _draw_pose_overlay(annotated, smoothed_mapped, color, min_keypoint_confidence)
+                if diagnostic_frame:
+                    _draw_pose_overlay(
+                        annotated,
+                        mapped,
+                        color,
+                        skeleton,
+                        min_keypoint_confidence,
+                        draw_lines=False,
+                    )
+                else:
+                    _draw_pose_overlay(
+                        annotated,
+                        smoothed_mapped,
+                        color,
+                        skeleton,
+                        min_keypoint_confidence,
+                        draw_lines=layout_name is not None,
+                    )
                 label_x, label_y = _select_label_position(smoothed_mapped)
                 cv2.putText(
                     annotated,
