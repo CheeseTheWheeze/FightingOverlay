@@ -142,6 +142,29 @@ jobs:
             release_upload/FightingOverlay-Full-Windows.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Remove existing latest release tag
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $repo = "${{ github.repository }}"
+          try {
+            $release = Invoke-RestMethod -Method Get -Uri "https://api.github.com/repos/$repo/releases/tags/latest" -Headers $headers
+          } catch {
+            $release = $null
+          }
+          if ($release -and $release.id) {
+            Invoke-RestMethod -Method Delete -Uri "https://api.github.com/repos/$repo/releases/$($release.id)" -Headers $headers
+          }
+          try {
+            Invoke-RestMethod -Method Delete -Uri "https://api.github.com/repos/$repo/git/refs/tags/latest" -Headers $headers
+          } catch {
+          }
       - name: Create latest release
         uses: softprops/action-gh-release@v2
         with:

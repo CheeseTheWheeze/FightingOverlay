@@ -436,6 +436,11 @@ def get_latest_debug_pack_dir(output_root: Path) -> Path | None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="FightingOverlay Control Center")
     parser.add_argument("--test-mode", action="store_true", help="Run synthetic test and exit")
+    parser.add_argument(
+        "--ui-smoke-test",
+        action="store_true",
+        help="Build the UI, process idle events, and exit (fails on TclError).",
+    )
     args = parser.parse_args()
 
     setup_logging()
@@ -1635,7 +1640,15 @@ def main() -> None:
     log_text.configure(yscrollcommand=log_scroll.set)
     bind_mousewheel(log_text)
     paned_main.add(log_frame, weight=1)
-    paned_main.paneconfigure(log_frame, minsize=0)
+    try:
+        paned_main.pane(log_frame, minsize=0)
+    except TclError as exc:
+        logging.exception(
+            "Failed to configure paned window for logs (widget=%s, options=%s): %s",
+            paned_main.winfo_class(),
+            {"minsize": 0},
+            exc,
+        )
 
     handler = TkTextHandler(log_text, root)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -2005,7 +2018,20 @@ def main() -> None:
 
     set_running(False)
     logging.info("Control Center UI ready")
-    load_viewer_video()
+    if not args.ui_smoke_test:
+        load_viewer_video()
+
+    if args.ui_smoke_test:
+        try:
+            root.update_idletasks()
+            root.update()
+        except TclError as exc:
+            logging.exception("UI smoke test failed: %s", exc)
+            raise SystemExit(1) from exc
+        finally:
+            root.destroy()
+        logging.info("UI smoke test completed")
+        return
 
     root.mainloop()
 

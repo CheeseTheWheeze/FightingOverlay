@@ -16,6 +16,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 from subprocess import Popen, run
+import subprocess
 from typing import Any, Dict, Optional
 
 from core.paths import (
@@ -36,6 +37,10 @@ ASSET_NAME = "FightingOverlay-Full-Windows.zip"
 BOOTSTRAP_CACHE_NAME = "bootstrap_cache.json"
 BOOTSTRAP_ERROR_TITLE = "FightingOverlay failed to start"
 MAX_NETWORK_RETRIES = 2
+BOOTSTRAP_POINTER_NAME = "current_bootstrapper.txt"
+BOOTSTRAP_KEEP_VERSIONS = 3
+CONTROL_CENTER_STARTUP_WAIT_S = 1.0
+CONTROL_CENTER_LOG_LIMIT = 8192
 
 
 class CaptivePortalError(RuntimeError):
@@ -94,6 +99,25 @@ def ensure_directories() -> None:
     get_bootstrap_root().mkdir(parents=True, exist_ok=True)
 
 
+def get_bootstrapper_pointer_path() -> Path:
+    return get_bootstrap_root() / BOOTSTRAP_POINTER_NAME
+
+
+def resolve_bootstrapper_pointer() -> Optional[Path]:
+    pointer = get_bootstrapper_pointer_path()
+    if not pointer.exists():
+        return None
+    try:
+        target = Path(pointer.read_text(encoding="utf-8").strip())
+    except OSError:
+        logging.exception("Failed reading bootstrapper pointer")
+        return None
+    if not target.exists():
+        logging.warning("Bootstrapper pointer target missing: %s", target)
+        return None
+    return target
+
+
 def _sample_payload(payload: str, limit: int = 200) -> str:
     sample = payload[:limit]
     sample = " ".join(sample.split())
@@ -126,7 +150,14 @@ def fetch_latest_release(state: Dict[str, Any]) -> dict:
         logging.warning("UNEXPECTED_CONTENT_TYPE content_type=%s sample=%s", content_type, sample)
         raise RuntimeError("Update server returned unexpected content.")
     log_step(state, "PARSE_RELEASE_METADATA")
-    return json.loads(payload)
+    release = json.loads(payload)
+    log_step(
+        state,
+        "RESOLVED_RELEASE",
+        tag=release.get("tag_name"),
+        name=release.get("name"),
+    )
+    return release
 
 
 def download_asset(state: Dict[str, Any], url: str, destination: Path) -> None:
@@ -263,12 +294,31 @@ def copy_bootstrapper(version: str) -> Path:
         except PermissionError as exc:
             logging.warning("Bootstrapper copy failed: %s", exc)
             return destination
+    try:
+        atomic_write(get_bootstrapper_pointer_path(), str(versioned_destination.resolve()))
+        logging.info("Updated bootstrapper pointer to %s", versioned_destination)
+    except Exception:
+        logging.exception("Failed to update bootstrapper pointer")
+
+    if not destination.exists():
+        try:
+            shutil.copy2(versioned_destination, destination)
+        except PermissionError as exc:
+            logging.warning("Bootstrapper staging copy failed: %s", exc)
 
     try:
-        os.replace(versioned_destination, destination)
-    except PermissionError as exc:
-        logging.warning("Bootstrapper replace failed: %s", exc)
-    return destination
+        versioned_files = sorted(
+            bootstrap_root.glob("FightingOverlayBootstrap_*.exe"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for old_path in versioned_files[BOOTSTRAP_KEEP_VERSIONS:]:
+            logging.info("Pruning old bootstrapper %s", old_path)
+            old_path.unlink(missing_ok=True)
+    except OSError:
+        logging.exception("Failed pruning old bootstrapper versions")
+
+    return versioned_destination
 
 
 def _remove_path(path: Path) -> None:
@@ -289,6 +339,13 @@ def install_release(state: Dict[str, Any], release: dict, simulate_bad_zip: bool
         raise RuntimeError(f"Release is missing asset {ASSET_NAME}")
 
     version = release.get("tag_name") or release.get("name") or "unknown"
+    log_step(
+        state,
+        "SELECT_RELEASE_ASSET",
+        tag=version,
+        asset=asset.get("name"),
+        url=asset.get("browser_download_url"),
+    )
     temp_dir = Path(tempfile.mkdtemp(prefix="fightingoverlay_"))
     zip_path = temp_dir / ASSET_NAME
     extract_dir = temp_dir / "extract"
@@ -337,11 +394,118 @@ def find_offline_executable(target_dir: Path) -> Optional[Path]:
     return None
 
 
-def launch_control_center(target_dir: Path) -> None:
+def _read_log_snippet(path: Path, limit: int = CONTROL_CENTER_LOG_LIMIT) -> str:
+    if not path.exists():
+        return ""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        logging.exception("Failed reading ControlCenter log snippet: %s", path)
+        return ""
+    snippet = data[-limit:].decode("utf-8", errors="replace")
+    return _sample_payload(snippet, limit=200)
+
+
+def write_controlcenter_crash(
+    log_root: Path,
+    returncode: int,
+    snippet: str,
+    launch_log: Path,
+) -> None:
+    payload = (
+        f"timestamp_utc={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+        "classification=controlcenter_crash\n"
+        f"returncode={returncode}\n"
+        f"snippet={snippet}\n"
+        f"controlcenter_log_path={launch_log}\n"
+        f"log_path={log_root / 'bootstrap.log'}\n"
+    )
+    for candidate_root in (
+        log_root,
+        Path(tempfile.gettempdir()) / "FightingOverlay" / "logs",
+    ):
+        try:
+            candidate_root.mkdir(parents=True, exist_ok=True)
+            path = candidate_root / "bootstrap_last_error.txt"
+            atomic_write(path, payload)
+            return
+        except Exception:
+            try:
+                logging.exception("Failed to write bootstrap_last_error.txt in %s", candidate_root)
+            except Exception:
+                pass
+
+
+def show_controlcenter_crash_dialog(log_root: Path) -> None:
+    try:
+        import ctypes
+
+        response = ctypes.windll.user32.MessageBoxW(
+            0,
+            "ControlCenter crashed on startup. Open logs?",
+            BOOTSTRAP_ERROR_TITLE,
+            0x00000004,
+        )
+        if response == 6:  # IDYES
+            safe_open_logs(log_root)
+    except Exception:
+        logging.exception("Failed to show ControlCenter crash dialog")
+
+
+def launch_control_center(target_dir: Path, log_root: Path) -> bool:
     executable = find_offline_executable(target_dir)
     if not executable:
         raise RuntimeError("ControlCenter.exe not found in installed version")
-    Popen([str(executable)], cwd=str(executable.parent))
+
+    log_name = f"controlcenter_launch_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    launch_log = log_root / log_name
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    with launch_log.open("wb") as output_handle:
+        proc = Popen(
+            [str(executable)],
+            cwd=str(executable.parent),
+            stdout=output_handle,
+            stderr=output_handle,
+            creationflags=creationflags,
+        )
+        time.sleep(CONTROL_CENTER_STARTUP_WAIT_S)
+        returncode = proc.poll()
+        output_handle.flush()
+
+    if returncode is None:
+        logging.info("ControlCenter launched (pid=%s)", proc.pid)
+        return True
+
+    snippet = _read_log_snippet(launch_log)
+    logging.error(
+        "ControlCenter exited early returncode=%s log=%s snippet=%s",
+        returncode,
+        launch_log,
+        snippet,
+    )
+    write_controlcenter_crash(log_root, returncode, snippet, launch_log)
+    show_controlcenter_crash_dialog(log_root)
+    return False
+
+
+def maybe_handoff_to_current_bootstrapper(argv: list[str]) -> bool:
+    if os.environ.get("FIGHTINGOVERLAY_BOOTSTRAP_SKIP_HANDOFF") == "1":
+        return False
+    target = resolve_bootstrapper_pointer()
+    if not target:
+        return False
+    try:
+        if Path(sys.executable).resolve() == target.resolve():
+            return False
+    except OSError:
+        logging.exception("Failed comparing bootstrapper paths")
+        return False
+
+    env = os.environ.copy()
+    env["FIGHTINGOVERLAY_BOOTSTRAP_SKIP_HANDOFF"] = "1"
+    logging.info("Handing off to bootstrapper %s", target)
+    Popen([str(target), *argv[1:]], cwd=str(target.parent), env=env)
+    return True
 
 
 def get_cache_path() -> Path:
@@ -621,6 +785,10 @@ def main() -> int:
     log_path = setup_logging(log_root)
     logging.info("BOOTSTRAP_LOG_PATH=%s", log_path)
 
+    if maybe_handoff_to_current_bootstrapper(sys.argv):
+        logging.info("Bootstrapper handoff started; exiting current process")
+        return 0
+
     if args.self_test:
         return run_self_test()
 
@@ -688,6 +856,18 @@ def main() -> int:
                 raise RuntimeError("Failed to install update.")
 
             log_step(state, "LAUNCH_GUI", target_dir=target_dir)
+            launch_ok = launch_control_center(target_dir, log_root)
+            if not launch_ok:
+                record_last_update(
+                    "error",
+                    version,
+                    "ControlCenter crashed on startup",
+                    previous_version,
+                )
+                update_cache_attempt(version, "controlcenter_crash")
+                log_step(state, "CONTROL_CENTER_CRASH")
+                return 1
+
             atomic_write(get_current_pointer(), str(target_dir.resolve()))
             update_shortcut(target_dir / "ControlCenter.exe")
             try:
@@ -697,7 +877,6 @@ def main() -> int:
             record_last_update("success", version, "Installed successfully", previous_version)
             update_cache_success(version, target_dir)
             clean_old_versions(version, previous_version)
-            launch_control_center(target_dir)
             log_step(state, "BOOTSTRAP_SUCCESS")
             return 0
         except Exception as exc:
@@ -724,8 +903,9 @@ def main() -> int:
             if action == "offline" and cached_target:
                 try:
                     log_step(state, "LAUNCH_GUI_OFFLINE", target_dir=cached_target)
-                    launch_control_center(cached_target)
-                    return 0
+                    if launch_control_center(cached_target, log_root):
+                        return 0
+                    return 1
                 except Exception:
                     logging.exception("Offline launch failed")
                     return 1
