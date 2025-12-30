@@ -4,7 +4,10 @@ import argparse
 import json
 import logging
 import os
+import platform
 import shutil
+import socket
+import ssl
 import sys
 import tempfile
 import time
@@ -12,7 +15,8 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
-from subprocess import run, Popen
+from subprocess import Popen, run
+from typing import Any, Dict, Optional
 
 from core.paths import (
     get_app_root,
@@ -29,18 +33,55 @@ from core.paths import (
 
 RELEASES_URL = "https://api.github.com/repos/CheeseTheWheeze/FightingOverlay/releases/latest"
 ASSET_NAME = "FightingOverlay-Full-Windows.zip"
+BOOTSTRAP_CACHE_NAME = "bootstrap_cache.json"
+BOOTSTRAP_ERROR_TITLE = "FightingOverlay failed to start"
+MAX_NETWORK_RETRIES = 2
 
 
-def setup_logging() -> Path:
-    log_root = get_log_root()
-    log_root.mkdir(parents=True, exist_ok=True)
+class CaptivePortalError(RuntimeError):
+    pass
+
+
+def resolve_log_root() -> Path:
+    try:
+        log_root = get_log_root()
+        log_root.mkdir(parents=True, exist_ok=True)
+        return log_root
+    except Exception:
+        fallback = Path(tempfile.gettempdir()) / "FightingOverlay" / "logs"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+def setup_logging(log_root: Path) -> Path:
     log_path = log_root / "bootstrap.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=[logging.FileHandler(log_path, encoding="utf-8")],
     )
+    bootstrap_version = os.environ.get("FIGHTINGOVERLAY_BOOTSTRAP_VERSION", "unknown")
+    local_appdata = os.environ.get("LOCALAPPDATA", "unset")
+    logging.info(
+        "BOOTSTRAP_START frozen=%s bootstrap_version=%s python=%s os=%s executable=%s cwd=%s local_appdata=%s",
+        getattr(sys, "frozen", False),
+        bootstrap_version,
+        sys.version.replace("\n", " "),
+        platform.platform(),
+        sys.executable,
+        os.getcwd(),
+        local_appdata,
+    )
     return log_path
+
+
+def log_step(state: Dict[str, Any], step: str, **fields: Any) -> None:
+    state["step"] = step
+    extras = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+    if extras:
+        logging.info("BOOTSTRAP_STEP=%s %s", step, extras)
+    else:
+        logging.info("BOOTSTRAP_STEP=%s", step)
 
 
 def ensure_directories() -> None:
@@ -53,34 +94,89 @@ def ensure_directories() -> None:
     get_bootstrap_root().mkdir(parents=True, exist_ok=True)
 
 
-def show_message(title: str, message: str) -> None:
-    try:
-        import ctypes
-
-        ctypes.windll.user32.MessageBoxW(0, message, title, 0x00000000)
-    except Exception:
-        logging.info("Message: %s - %s", title, message)
+def _sample_payload(payload: str, limit: int = 200) -> str:
+    sample = payload[:limit]
+    sample = " ".join(sample.split())
+    return sample
 
 
-def fetch_latest_release() -> dict:
+def _captive_portal_suspected(payload: str, content_type: str) -> bool:
+    if "application/json" in content_type.lower():
+        return False
+    lowered = payload[:200].lower()
+    markers = ("<html", "<!doctype", "</html", "http-equiv=\"refresh\"", "captive portal")
+    return any(marker in lowered for marker in markers)
+
+
+def fetch_latest_release(state: Dict[str, Any]) -> dict:
+    log_step(state, "FETCH_LATEST_RELEASE", url=RELEASES_URL)
     request = urllib.request.Request(
         RELEASES_URL,
         headers={"Accept": "application/vnd.github+json", "User-Agent": "FightingOverlayBootstrap"},
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         payload = response.read().decode("utf-8")
+        content_type = response.headers.get("Content-Type", "")
+    if _captive_portal_suspected(payload, content_type):
+        sample = _sample_payload(payload)
+        logging.warning("CAPTIVE_PORTAL_SUSPECTED content_type=%s sample=%s", content_type, sample)
+        raise CaptivePortalError("Update server returned HTML (possible captive portal).")
+    if "application/json" not in content_type.lower():
+        sample = _sample_payload(payload)
+        logging.warning("UNEXPECTED_CONTENT_TYPE content_type=%s sample=%s", content_type, sample)
+        raise RuntimeError("Update server returned unexpected content.")
+    log_step(state, "PARSE_RELEASE_METADATA")
     return json.loads(payload)
 
 
-def download_asset(url: str, destination: Path) -> None:
-    logging.info("Downloading asset from %s", url)
-    with urllib.request.urlopen(url, timeout=60) as response, destination.open("wb") as handle:
-        shutil.copyfileobj(response, handle)
+def download_asset(state: Dict[str, Any], url: str, destination: Path) -> None:
+    log_step(state, "DOWNLOAD_ASSET", url=url, destination=destination)
+    temp_path = destination.with_name(f"{destination.name}.partial")
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response, temp_path.open("wb") as handle:
+            shutil.copyfileobj(response, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, destination)
+    except Exception:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                logging.exception("Failed to clean up partial download: %s", temp_path)
+        raise
 
 
-def extract_zip(zip_path: Path, destination: Path) -> None:
+def extract_zip(state: Dict[str, Any], zip_path: Path, destination: Path) -> None:
+    log_step(state, "EXTRACT_ASSET", zip_path=zip_path, destination=destination)
     with zipfile.ZipFile(zip_path, "r") as archive:
         archive.extractall(destination)
+
+
+def is_retryable_fetch_error(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in {408, 429} or 500 <= exc.code <= 599
+    if isinstance(
+        exc,
+        (
+            urllib.error.URLError,
+            socket.gaierror,
+            socket.timeout,
+            TimeoutError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+        ),
+    ):
+        return True
+    return False
+
+
+def is_retryable_install_error(exc: Exception) -> bool:
+    if isinstance(exc, zipfile.BadZipFile):
+        return True
+    if isinstance(exc, PermissionError):
+        return False
+    return isinstance(exc, OSError)
 
 
 def atomic_write(path: Path, content: str) -> None:
@@ -91,9 +187,9 @@ def atomic_write(path: Path, content: str) -> None:
 
 def record_last_update(
     status: str,
-    version: str | None,
-    message: str | None = None,
-    previous_version: str | None = None,
+    version: Optional[str],
+    message: Optional[str] = None,
+    previous_version: Optional[str] = None,
 ) -> None:
     payload = {
         "status": status,
@@ -105,7 +201,7 @@ def record_last_update(
     get_last_update_path().write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def clean_old_versions(current_version: str, previous_version: str | None) -> None:
+def clean_old_versions(current_version: str, previous_version: Optional[str]) -> None:
     versions_root = get_versions_root()
     keep = {current_version}
     if previous_version:
@@ -175,7 +271,18 @@ def copy_bootstrapper(version: str) -> Path:
     return destination
 
 
-def install_release(release: dict) -> Path:
+def _remove_path(path: Path) -> None:
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.exists():
+            path.unlink()
+    except OSError:
+        logging.exception("Failed to remove path: %s", path)
+
+
+def install_release(state: Dict[str, Any], release: dict, simulate_bad_zip: bool) -> Path:
+    log_step(state, "INSTALL_RELEASE")
     assets = release.get("assets", [])
     asset = next((item for item in assets if item.get("name") == ASSET_NAME), None)
     if not asset:
@@ -187,8 +294,21 @@ def install_release(release: dict) -> Path:
     extract_dir = temp_dir / "extract"
     extract_dir.mkdir(parents=True, exist_ok=True)
 
-    download_asset(asset["browser_download_url"], zip_path)
-    extract_zip(zip_path, extract_dir)
+    if simulate_bad_zip:
+        raise zipfile.BadZipFile("Simulated bad zip")
+
+    download_asset(state, asset["browser_download_url"], zip_path)
+    log_step(state, "VERIFY_ASSET", zip_path=zip_path)
+    if not zipfile.is_zipfile(zip_path):
+        _remove_path(zip_path)
+        raise zipfile.BadZipFile("Downloaded asset is not a valid zip")
+
+    try:
+        extract_zip(state, zip_path, extract_dir)
+    except (zipfile.BadZipFile, OSError) as exc:
+        _remove_path(zip_path)
+        _remove_path(extract_dir)
+        raise exc
 
     versions_root = get_versions_root()
     target_dir = versions_root / version
@@ -199,16 +319,279 @@ def install_release(release: dict) -> Path:
     return target_dir
 
 
+def find_offline_executable(target_dir: Path) -> Optional[Path]:
+    candidates = [
+        target_dir / "ControlCenter.exe",
+        target_dir / "ControlCenter" / "ControlCenter.exe",
+        target_dir / "bin" / "ControlCenter.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            logging.info("Offline executable found at %s", candidate)
+            return candidate
+    try:
+        entries = [entry.name for entry in list(target_dir.iterdir())[:30]]
+        logging.warning("Offline executable not found. Top-level entries: %s", entries)
+    except OSError:
+        logging.exception("Failed to list offline target directory: %s", target_dir)
+    return None
+
+
 def launch_control_center(target_dir: Path) -> None:
-    executable = target_dir / "ControlCenter.exe"
-    if not executable.exists():
+    executable = find_offline_executable(target_dir)
+    if not executable:
         raise RuntimeError("ControlCenter.exe not found in installed version")
-    Popen([str(executable)], cwd=str(target_dir))
+    Popen([str(executable)], cwd=str(executable.parent))
+
+
+def get_cache_path() -> Path:
+    return get_app_root() / BOOTSTRAP_CACHE_NAME
+
+
+def read_bootstrap_cache() -> Optional[Dict[str, Any]]:
+    try:
+        cache_path = get_cache_path()
+    except Exception:
+        logging.exception("Unable to resolve cache path")
+        return None
+    if not cache_path.exists():
+        return None
+    try:
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        corrupt_path = cache_path.with_name(f"{cache_path.name}.corrupt.{timestamp}")
+        try:
+            os.replace(cache_path, corrupt_path)
+            logging.warning("Cached install metadata corrupt; renamed to %s", corrupt_path)
+        except OSError:
+            logging.exception("Failed to quarantine corrupt cache file")
+        return None
+
+
+def write_bootstrap_cache(payload: Dict[str, Any]) -> None:
+    try:
+        cache_path = get_cache_path()
+    except Exception:
+        logging.exception("Unable to resolve cache path")
+        return
+    atomic_write(cache_path, json.dumps(payload, indent=2))
+
+
+def update_cache_success(version: str, target_dir: Path) -> None:
+    payload = read_bootstrap_cache() or {}
+    payload.update(
+        {
+            "last_good_version": version,
+            "last_good_path": str(target_dir.resolve()),
+            "last_success_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+    )
+    write_bootstrap_cache(payload)
+
+
+def update_cache_attempt(version: Optional[str], status: str) -> None:
+    payload = read_bootstrap_cache() or {}
+    payload.update(
+        {
+            "last_attempt_version": version,
+            "last_attempt_status": status,
+        }
+    )
+    write_bootstrap_cache(payload)
+
+
+def validate_offline_target(target_dir: Path) -> bool:
+    if not target_dir.exists():
+        logging.warning("Offline target missing: %s", target_dir)
+        return False
+    executable = find_offline_executable(target_dir)
+    if not executable:
+        logging.warning("Offline target missing ControlCenter.exe under: %s", target_dir)
+        return False
+    return True
+
+
+def resolve_offline_target(state: Dict[str, Any]) -> Optional[Path]:
+    log_step(state, "RESOLVE_OFFLINE_TARGET")
+    cache = read_bootstrap_cache()
+    if cache:
+        cached_path = Path(cache.get("last_good_path", ""))
+        if cached_path and validate_offline_target(cached_path):
+            state["cached_version"] = cache.get("last_good_version")
+            return cached_path
+    try:
+        current_pointer = get_current_pointer()
+    except Exception:
+        logging.exception("Unable to resolve current install pointer")
+        return None
+    if current_pointer.exists():
+        try:
+            target = Path(current_pointer.read_text(encoding="utf-8").strip())
+        except OSError:
+            logging.exception("Failed reading current pointer")
+            return None
+        if validate_offline_target(target):
+            return target
+    return None
+
+
+def safe_open_logs(log_root: Path) -> None:
+    try:
+        os.startfile(log_root)  # type: ignore[attr-defined]
+    except Exception:
+        logging.exception("Failed to open logs folder: %s", log_root)
+
+
+def classify_exception(exc: Exception) -> tuple[str, str, str]:
+    if isinstance(exc, CaptivePortalError):
+        return (
+            "Couldn’t check for updates because the network requires sign-in.",
+            "Open a browser to complete any Wi-Fi sign-in page, then retry.",
+            "captive_portal_suspected",
+        )
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code in {403, 429}:
+            return (
+                "Couldn’t check for updates because GitHub blocked the request.",
+                "GitHub may be blocked or rate-limiting. Try again later or use another network.",
+                "http_blocked",
+            )
+        if exc.code == 404:
+            return (
+                "No release is available yet.",
+                "Try again later. If this persists, contact support.",
+                "http_not_found",
+            )
+        return (
+            "The update server returned an error.",
+            f"HTTP error {exc.code}. Check your internet connection, VPN, or firewall.",
+            "http_error",
+        )
+    if isinstance(exc, ssl.SSLError):
+        return (
+            "Secure connection to the update server failed.",
+            "Corporate proxies or antivirus HTTPS inspection can cause this. Try another network.",
+            "tls_error",
+        )
+    if isinstance(exc, socket.gaierror):
+        return (
+            "Couldn’t resolve the update server address.",
+            "DNS lookup failed. Try switching networks or disabling VPN/proxy.",
+            "dns_failure",
+        )
+    if isinstance(exc, urllib.error.URLError):
+        return (
+            "Couldn’t reach the update server.",
+            "Check your internet connection, captive portal sign-in, VPN/proxy, or firewall.",
+            "network_unreachable",
+        )
+    if isinstance(exc, (TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError)):
+        return (
+            "The network connection was interrupted.",
+            "Try again after checking your internet connection or firewall.",
+            "network_interrupted",
+        )
+    if isinstance(exc, json.JSONDecodeError):
+        return (
+            "Couldn’t read update metadata.",
+            "A captive portal or proxy may be intercepting the connection.",
+            "metadata_parse_error",
+        )
+    if isinstance(exc, (zipfile.BadZipFile, OSError)):
+        return (
+            "The update download was corrupt or incomplete.",
+            "Try again. If it keeps failing, check your disk space or antivirus settings.",
+            "asset_error",
+        )
+    return (
+        "FightingOverlay couldn’t start due to an unexpected error.",
+        "Try again or check the logs for details.",
+        "unexpected_error",
+    )
+
+
+def build_user_message(summary: str, hint: str, log_root: Path) -> str:
+    return (
+        f"{summary}\n\n"
+        "Common causes:\n"
+        "- Offline or unstable internet\n"
+        "- DNS issues\n"
+        "- VPN/proxy/firewall blocking GitHub\n"
+        "- Captive portal (sign-in Wi-Fi page)\n"
+        "- Antivirus HTTPS inspection\n\n"
+        f"Next steps: {hint}\n\n"
+        f"Log file: {log_root / 'bootstrap.log'}\n"
+        "Choose Retry to try again or Cancel for more options."
+    )
+
+
+def write_last_error(log_root: Path, classification: str, summary: str, hint: str) -> None:
+    payload = (
+        f"timestamp_utc={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+        f"classification={classification}\n"
+        f"summary={summary}\n"
+        f"hint={hint}\n"
+        f"log_path={log_root / 'bootstrap.log'}\n"
+    )
+    for candidate_root in (
+        log_root,
+        Path(tempfile.gettempdir()) / "FightingOverlay" / "logs",
+    ):
+        try:
+            candidate_root.mkdir(parents=True, exist_ok=True)
+            path = candidate_root / "bootstrap_last_error.txt"
+            atomic_write(path, payload)
+            return
+        except Exception:
+            try:
+                logging.exception("Failed to write bootstrap_last_error.txt in %s", candidate_root)
+            except Exception:
+                pass
+
+
+def show_startup_dialog(
+    state: Dict[str, Any],
+    summary: str,
+    hint: str,
+    log_root: Path,
+    offline_available: bool,
+) -> str:
+    try:
+        import ctypes
+
+        message = build_user_message(summary, hint, log_root)
+        response = ctypes.windll.user32.MessageBoxW(0, message, BOOTSTRAP_ERROR_TITLE, 0x00000005)
+        if response == 4:  # IDRETRY
+            return "retry"
+
+        if offline_available:
+            response = ctypes.windll.user32.MessageBoxW(
+                0,
+                "Run the last installed version offline?\nYes = Run Offline\nNo = Skip",
+                BOOTSTRAP_ERROR_TITLE,
+                0x00000004,
+            )
+            if response == 6:  # IDYES
+                return "offline"
+
+        response = ctypes.windll.user32.MessageBoxW(
+            0,
+            "Open logs folder?\nYes = Open Logs\nNo = Exit",
+            BOOTSTRAP_ERROR_TITLE,
+            0x00000004,
+        )
+        if response == 6:  # IDYES
+            safe_open_logs(log_root)
+            return "open_logs"
+        return "exit"
+    except Exception:
+        logging.exception("Failed to show startup dialog")
+        return "exit"
 
 
 def run_self_test() -> int:
     ensure_directories()
-    setup_logging()
     logging.info("Self-test completed")
     return 0
 
@@ -217,50 +600,136 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="FightingOverlay Bootstrapper")
     parser.add_argument("--self-test", action="store_true", help="Run bootstrapper self-test")
     parser.add_argument("--update", action="store_true", help="Run update mode")
+    parser.add_argument(
+        "--simulate-offline",
+        action="store_true",
+        help="Simulate offline failure without network access",
+    )
+    parser.add_argument(
+        "--simulate-captive-portal",
+        action="store_true",
+        help="Simulate captive portal response",
+    )
+    parser.add_argument(
+        "--simulate-bad-zip",
+        action="store_true",
+        help="Simulate a corrupt release archive",
+    )
     args = parser.parse_args()
+
+    log_root = resolve_log_root()
+    log_path = setup_logging(log_root)
+    logging.info("BOOTSTRAP_LOG_PATH=%s", log_path)
 
     if args.self_test:
         return run_self_test()
 
-    ensure_directories()
-    log_path = setup_logging()
-    logging.info("Bootstrap started")
-    logging.info("Log path: %s", log_path)
-
+    user_retry_count = 0
     previous_version = None
-    current_pointer = get_current_pointer()
-    if current_pointer.exists():
-        previous_version = Path(current_pointer.read_text(encoding="utf-8").strip()).name
-
-    try:
-        release = fetch_latest_release()
-    except urllib.error.HTTPError as error:
-        if error.code == 404:
-            record_last_update("no_release", None, "No release published yet", previous_version)
-            show_message("FightingOverlay", "No release published yet")
-            return 0
-        record_last_update("error", None, f"HTTP error {error.code}", previous_version)
-        raise
-
-    version = release.get("tag_name") or release.get("name") or "unknown"
-    try:
-        target_dir = install_release(release)
-        atomic_write(get_current_pointer(), str(target_dir.resolve()))
-        update_shortcut(target_dir / "ControlCenter.exe")
+    state: Dict[str, Any] = {"step": "INIT"}
+    while True:
         try:
-            copy_bootstrapper(version)
-        except PermissionError as exc:
-            logging.warning("Bootstrapper update skipped due to permission error: %s", exc)
-        record_last_update("success", version, "Installed successfully", previous_version)
-        clean_old_versions(version, previous_version)
-        launch_control_center(target_dir)
-    except Exception as exc:
-        logging.exception("Bootstrap failed")
-        record_last_update("error", version, str(exc), previous_version)
-        show_message("FightingOverlay", f"Install/update failed: {exc}")
-        return 1
+            log_step(state, "ENSURE_DIRECTORIES")
+            ensure_directories()
 
-    return 0
+            log_step(state, "READ_CURRENT_POINTER")
+            current_pointer = get_current_pointer()
+            if current_pointer.exists():
+                previous_version = Path(current_pointer.read_text(encoding="utf-8").strip()).name
+
+            if args.simulate_offline:
+                raise urllib.error.URLError("Simulated offline mode")
+            if args.simulate_captive_portal:
+                raise CaptivePortalError("Simulated captive portal")
+
+            if args.simulate_bad_zip:
+                release = {
+                    "tag_name": "simulated-bad-zip",
+                    "assets": [
+                        {
+                            "name": ASSET_NAME,
+                            "browser_download_url": "https://example.invalid/simulated.zip",
+                        }
+                    ],
+                }
+            else:
+                release = None
+                for attempt in range(MAX_NETWORK_RETRIES + 1):
+                    try:
+                        release = fetch_latest_release(state)
+                        break
+                    except Exception as exc:
+                        logging.exception("FETCH_LATEST_RELEASE failed (attempt %s)", attempt + 1)
+                        if not is_retryable_fetch_error(exc) or attempt >= MAX_NETWORK_RETRIES:
+                            raise
+                        backoff = 1 if attempt == 0 else 3
+                        logging.info("Retrying after %ss backoff", backoff)
+                        time.sleep(backoff)
+
+                if release is None:
+                    raise RuntimeError("Failed to fetch latest release.")
+
+            version = release.get("tag_name") or release.get("name") or "unknown"
+            state["target_version"] = version
+            target_dir = None
+            for attempt in range(MAX_NETWORK_RETRIES + 1):
+                try:
+                    target_dir = install_release(state, release, args.simulate_bad_zip)
+                    break
+                except (zipfile.BadZipFile, OSError, RuntimeError) as exc:
+                    logging.exception("INSTALL_RELEASE failed (attempt %s)", attempt + 1)
+                    if not is_retryable_install_error(exc) or attempt >= MAX_NETWORK_RETRIES:
+                        raise exc
+                    backoff = 1 if attempt == 0 else 3
+                    logging.info("Retrying after %ss backoff", backoff)
+                    time.sleep(backoff)
+
+            if target_dir is None:
+                raise RuntimeError("Failed to install update.")
+
+            log_step(state, "LAUNCH_GUI", target_dir=target_dir)
+            atomic_write(get_current_pointer(), str(target_dir.resolve()))
+            update_shortcut(target_dir / "ControlCenter.exe")
+            try:
+                copy_bootstrapper(version)
+            except PermissionError as exc:
+                logging.warning("Bootstrapper update skipped due to permission error: %s", exc)
+            record_last_update("success", version, "Installed successfully", previous_version)
+            update_cache_success(version, target_dir)
+            clean_old_versions(version, previous_version)
+            launch_control_center(target_dir)
+            log_step(state, "BOOTSTRAP_SUCCESS")
+            return 0
+        except Exception as exc:
+            summary, hint, classification = classify_exception(exc)
+            logging.exception(
+                "BOOTSTRAP_FAILURE step=%s classification=%s", state.get("step"), classification
+            )
+            try:
+                record_last_update("error", state.get("target_version"), str(exc), previous_version)
+            except Exception:
+                logging.exception("Failed to record last update")
+            update_cache_attempt(state.get("target_version"), classification)
+            cached_target = resolve_offline_target(state)
+            offline_available = cached_target is not None
+            log_step(state, "SHOW_DIALOG", classification=classification, offline_available=offline_available)
+            write_last_error(log_root, classification, summary, hint)
+            action = show_startup_dialog(state, summary, hint, log_root, offline_available)
+            if action == "retry":
+                user_retry_count += 1
+                if user_retry_count > MAX_NETWORK_RETRIES:
+                    logging.info("User retry limit reached")
+                    return 1
+                continue
+            if action == "offline" and cached_target:
+                try:
+                    log_step(state, "LAUNCH_GUI_OFFLINE", target_dir=cached_target)
+                    launch_control_center(cached_target)
+                    return 0
+                except Exception:
+                    logging.exception("Offline launch failed")
+                    return 1
+            return 1
 
 
 if __name__ == "__main__":

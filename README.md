@@ -66,11 +66,32 @@ $sentinel = "$env:LOCALAPPDATA\FightingOverlay\data\sentinel.txt"
 Get-Content $sentinel
 ```
 
-**Verify release zip does not contain itself:**
+**Verify release zip contains ControlCenter.exe:**
 ```powershell
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-[System.IO.Compression.ZipFile]::OpenRead("FightingOverlay-Full-Windows.zip").Entries | Where-Object { $_.Name -eq "FightingOverlay-Full-Windows.zip" }
+$zip = [System.IO.Compression.ZipFile]::OpenRead("FightingOverlay-Full-Windows.zip")
+$zip.Entries | Where-Object { $_.FullName -like "*ControlCenter.exe" }
+$zip.Dispose()
 ```
+
+## Bootstrapper Manual Tests (Windows)
+
+> Run these by double-clicking `FightingOverlayBootstrap.exe` and observing dialogs/logs.
+> Dialog sequence: Stage 1 (Retry/Cancel) → Stage 2 (Run Offline? if available) → Stage 3 (Open Logs?).
+> Log entries to confirm: `BOOTSTRAP_START`, `BOOTSTRAP_STEP=FETCH_LATEST_RELEASE`, `BOOTSTRAP_FAILURE`, `BOOTSTRAP_STEP=SHOW_DIALOG`.
+> Breadcrumb file: `%LOCALAPPDATA%\\FightingOverlay\\logs\\bootstrap_last_error.txt` (or temp fallback if logs are redirected).
+
+- **Offline mode:** disable network adapter, launch, confirm dialog appears with log path and Stage 1/2/3 flow.
+- **DNS failure:** set invalid DNS (e.g., `127.0.0.1`), launch, confirm DNS hint appears.
+- **Captive portal:** use public Wi-Fi with sign-in page, launch, confirm captive portal hint appears.
+- **TLS intercept:** enable corporate proxy/HTTPS inspection (if available), launch, confirm TLS hint appears.
+- **GitHub blocked/rate-limited:** block `api.github.com` or hit rate limit, launch, confirm blocked/rate-limit hint appears.
+- **Corrupt cached download:** truncate the cached zip (or delete it), launch, confirm retry + cleanup messaging and successful re-download.
+- **Permissions/AV lock:** simulate file lock on `%LOCALAPPDATA%\FightingOverlay\app`, launch, confirm permissions hint appears.
+- **Simulated failures (PowerShell):**
+  - `FightingOverlayBootstrap.exe --simulate-offline`
+  - `FightingOverlayBootstrap.exe --simulate-captive-portal`
+  - `FightingOverlayBootstrap.exe --simulate-bad-zip`
 
 ## Known Limitations / Roadmap
 
