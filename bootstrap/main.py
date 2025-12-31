@@ -78,6 +78,7 @@ def setup_logging(log_root: Path) -> Path:
         os.getcwd(),
         local_appdata,
     )
+    logging.info("BOOTSTRAP_START argv=%s sys.path.head=%s", sys.argv, sys.path[:6])
     return log_path
 
 
@@ -470,13 +471,13 @@ def write_controlcenter_crash(
                 pass
 
 
-def show_controlcenter_crash_dialog(log_root: Path) -> None:
+def show_controlcenter_crash_dialog(log_root: Path, launch_log: Path) -> None:
     try:
         import ctypes
 
         response = ctypes.windll.user32.MessageBoxW(
             0,
-            "ControlCenter crashed on startup. Open logs?",
+            f"ControlCenter crashed on startup.\n\nLog file:\n{launch_log}\n\nOpen logs folder?",
             BOOTSTRAP_ERROR_TITLE,
             0x00000004,
         )
@@ -493,7 +494,12 @@ def launch_control_center(target_dir: Path, log_root: Path) -> bool:
 
     log_name = f"controlcenter_launch_{time.strftime('%Y%m%d_%H%M%S')}.log"
     launch_log = log_root / log_name
-    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    hide_console = os.environ.get("FIGHTINGOVERLAY_SHOW_CONSOLE") != "1"
+    if hide_console and os.name == "nt":
+        creationflags = subprocess.CREATE_NO_WINDOW
+    else:
+        creationflags = 0
+        logging.info("ControlCenter console window enabled (debug).")
     with launch_log.open("wb") as output_handle:
         proc = Popen(
             [str(executable)],
@@ -502,8 +508,10 @@ def launch_control_center(target_dir: Path, log_root: Path) -> bool:
             stderr=output_handle,
             creationflags=creationflags,
         )
-        time.sleep(CONTROL_CENTER_STARTUP_WAIT_S)
-        returncode = proc.poll()
+        try:
+            returncode = proc.wait(timeout=CONTROL_CENTER_STARTUP_WAIT_S)
+        except subprocess.TimeoutExpired:
+            returncode = None
         output_handle.flush()
 
     if returncode is None:
@@ -518,7 +526,7 @@ def launch_control_center(target_dir: Path, log_root: Path) -> bool:
         snippet,
     )
     write_controlcenter_crash(log_root, returncode, snippet, launch_log)
-    show_controlcenter_crash_dialog(log_root)
+    show_controlcenter_crash_dialog(log_root, launch_log)
     return False
 
 

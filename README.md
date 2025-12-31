@@ -28,6 +28,22 @@ FightingOverlay is a Windows desktop app for running a single Control Center UI 
 
 **Updating:** Open Control Center → **Update Now**.
 
+## Troubleshooting
+
+**Logs live here:** `%LOCALAPPDATA%\\FightingOverlay\\logs` (look for `control_center.log` and `controlcenter_launch_*.log`).
+
+**UI smoke test (Windows):**
+```powershell
+$env:FIGHTINGOVERLAY_UI_SMOKE = "1"
+python apps/control_center/main.py --ui-smoke-test
+```
+
+**If OpenCV (cv2) is missing:** reinstall the latest FightingOverlay release so the bundled dependencies are restored. The Control Center will surface the error and point to the log file for details.
+
+**Debug verbosity / diagnostics:**
+- Launch Control Center with `--debug-console` to show a Diagnostics tab and verbose logs.
+- Set `FIGHTINGOVERLAY_SHOW_CONSOLE=1` before running the bootstrapper to disable `CREATE_NO_WINDOW` during GUI launch.
+
 ## Developer build (optional)
 
 **CI / Release:**
