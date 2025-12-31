@@ -38,6 +38,7 @@ from core.paths import (
     get_bootstrapper_path,
     get_codex_packets_root,
     get_current_pointer,
+    get_data_root,
     get_last_update_path,
     get_log_root,
     get_outputs_root,
@@ -645,17 +646,83 @@ def main() -> None:
     dev_tab.rowconfigure(0, weight=1)
     dev_tab.columnconfigure(0, weight=1)
 
+    def on_open_outputs() -> None:
+        open_folder(get_outputs_root())
+
+    def on_open_logs() -> None:
+        open_folder(get_log_root())
+
+    def on_select_data_directory() -> None:
+        selected_dir = filedialog.askdirectory(
+            title="Select Data Directory",
+            initialdir=str(get_data_root()),
+        )
+        if selected_dir:
+            settings["last_output_path"] = selected_dir
+            save_settings(settings)
+            open_folder(Path(selected_dir))
+            logging.info("Selected data directory: %s", selected_dir)
+
     notebook.add(run_tab, text="Run / Processing")
     notebook.add(data_tab, text="Data & Storage")
     notebook.add(settings_tab, text="Settings")
     notebook.add(dev_tab, text="Dev Mode")
 
+    if not notebook.tabs():
+        logging.warning("UI_BUILD completed without any panels mounted. Rendering fallback panel.")
+        fallback_tab = ttk.Frame(notebook, style="Card.TFrame")
+        fallback_tab.columnconfigure(0, weight=1)
+        fallback_tab.rowconfigure(1, weight=1)
+        ttk.Label(fallback_tab, text="Getting Started", style="Subheader.TLabel").grid(
+            row=0, column=0, sticky="w", padx=12, pady=(12, 6)
+        )
+        fallback_body = ttk.Frame(fallback_tab, padding=12, style="Card.TFrame")
+        fallback_body.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        fallback_body.columnconfigure(0, weight=1)
+        ttk.Label(
+            fallback_body,
+            text="Choose a data directory, then run the overlay or open logs.",
+            style="Card.TLabel",
+            wraplength=int(520 * scale),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        fallback_actions = ttk.Frame(fallback_body)
+        fallback_actions.grid(row=1, column=0, sticky="ew")
+        fallback_actions.columnconfigure(0, weight=1)
+        fallback_actions.columnconfigure(1, weight=1)
+        fallback_actions.columnconfigure(2, weight=1)
+        ttk.Button(
+            fallback_actions,
+            text="Select Data Directory",
+            style="Accent.TButton",
+            command=on_select_data_directory,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(
+            fallback_actions,
+            text="Run Overlay",
+            command=lambda: on_run_overlay(),
+        ).grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        ttk.Button(
+            fallback_actions,
+            text="Open Logs Folder",
+            command=on_open_logs,
+        ).grid(row=0, column=2, sticky="ew")
+        notebook.add(fallback_tab, text="Getting Started")
+
     last_tab = settings.get("last_selected_tab")
+    tabs = notebook.tabs()
     if last_tab:
-        for tab_id in notebook.tabs():
+        selected = False
+        for tab_id in tabs:
             if notebook.tab(tab_id, "text") == last_tab:
                 notebook.select(tab_id)
+                selected = True
                 break
+        if not selected and tabs:
+            default_tab_id = str(run_tab)
+            notebook.select(default_tab_id if default_tab_id in tabs else tabs[0])
+    elif tabs:
+        default_tab_id = str(run_tab)
+        notebook.select(default_tab_id if default_tab_id in tabs else tabs[0])
 
     def on_tab_changed(_event: object) -> None:
         selected = notebook.tab(notebook.select(), "text")
@@ -683,12 +750,6 @@ def main() -> None:
             settings["last_video_path"] = path
             save_settings(settings)
             logging.info("Selected video: %s", path)
-
-    def on_open_outputs() -> None:
-        open_folder(get_outputs_root())
-
-    def on_open_logs() -> None:
-        open_folder(get_log_root())
 
     dev_log_filter_var = StringVar(value="")
     dev_judge_report_var = StringVar(value="Judge report: --")
