@@ -41,6 +41,7 @@ BOOTSTRAP_POINTER_NAME = "current_bootstrapper.txt"
 BOOTSTRAP_KEEP_VERSIONS = 3
 CONTROL_CENTER_STARTUP_WAIT_S = 1.0
 CONTROL_CENTER_LOG_LIMIT = 8192
+DESKTOP_ERROR_LOG_NAME = "FightingOverlayBootstrap_errorlog.txt"
 
 
 class CaptivePortalError(RuntimeError):
@@ -78,6 +79,32 @@ def setup_logging(log_root: Path) -> Path:
         local_appdata,
     )
     return log_path
+
+
+def resolve_desktop_error_log_path(log_root: Path) -> Path:
+    candidates = []
+    userprofile = os.environ.get("USERPROFILE")
+    if userprofile:
+        candidates.append(Path(userprofile) / "Desktop")
+    try:
+        candidates.append(Path.home() / "Desktop")
+    except Exception:
+        logging.exception("Failed resolving home directory for Desktop path")
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_dir():
+            return candidate / DESKTOP_ERROR_LOG_NAME
+    return log_root / DESKTOP_ERROR_LOG_NAME
+
+
+def write_error_payload(path: Path, payload: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(path, payload)
+    except Exception:
+        try:
+            logging.exception("Failed to write error log payload: %s", path)
+        except Exception:
+            pass
 
 
 def log_step(state: Dict[str, Any], step: str, **fields: Any) -> None:
@@ -412,14 +439,21 @@ def write_controlcenter_crash(
     snippet: str,
     launch_log: Path,
 ) -> None:
+    classification = "controlcenter_crash"
+    summary = "ControlCenter crashed on startup."
+    hint = "Review the ControlCenter launch log and bootstrap log for details."
     payload = (
         f"timestamp_utc={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-        "classification=controlcenter_crash\n"
+        f"classification={classification}\n"
+        f"summary={summary}\n"
+        f"hint={hint}\n"
         f"returncode={returncode}\n"
         f"snippet={snippet}\n"
         f"controlcenter_log_path={launch_log}\n"
         f"log_path={log_root / 'bootstrap.log'}\n"
     )
+    desktop_path = resolve_desktop_error_log_path(log_root)
+    write_error_payload(desktop_path, payload)
     for candidate_root in (
         log_root,
         Path(tempfile.gettempdir()) / "FightingOverlay" / "logs",
@@ -676,6 +710,7 @@ def classify_exception(exc: Exception) -> tuple[str, str, str]:
 
 
 def build_user_message(summary: str, hint: str, log_root: Path) -> str:
+    desktop_log_path = resolve_desktop_error_log_path(log_root)
     return (
         f"{summary}\n\n"
         "Common causes:\n"
@@ -686,6 +721,7 @@ def build_user_message(summary: str, hint: str, log_root: Path) -> str:
         "- Antivirus HTTPS inspection\n\n"
         f"Next steps: {hint}\n\n"
         f"Log file: {log_root / 'bootstrap.log'}\n"
+        f"Desktop log: {desktop_log_path}\n"
         "Choose Retry to try again or Cancel for more options."
     )
 
@@ -698,6 +734,8 @@ def write_last_error(log_root: Path, classification: str, summary: str, hint: st
         f"hint={hint}\n"
         f"log_path={log_root / 'bootstrap.log'}\n"
     )
+    desktop_path = resolve_desktop_error_log_path(log_root)
+    write_error_payload(desktop_path, payload)
     for candidate_root in (
         log_root,
         Path(tempfile.gettempdir()) / "FightingOverlay" / "logs",
