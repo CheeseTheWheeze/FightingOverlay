@@ -114,3 +114,275 @@ $zip.Dispose()
 - **Mock today:** "Open Video + Run Overlay" is a stub and will show a message until inference is implemented.
 - **Planned:** full inference pipeline integration with model download and caching.
 - **Planned:** API service (`apps/api`) and Android remote update agent for device-triggered capture.
+
+## Codex Prompt
+
+You are Codex working on the project contained in the provided zip (repo). Your job is to **rebuild the project from the ground up into a clean, scalable architecture** while also delivering an immediate, working MVP: a desktop GUI that can select a video, extract skeleton data, and export an overlay video.
+
+### Non-negotiable immediate MVP requirements (must work first)
+
+1. Desktop GUI launches on Windows 11 reliably (including virtualized/streamed environments like Shadow PC).
+2. User selects a video clip (MP4).
+3. System extracts skeleton/pose keypoints over time.
+4. System writes:
+
+   * `pose_tracks.json` (or `.parquet`) with frame timestamps + keypoints + confidences
+   * an overlay MP4 showing skeleton over the video
+5. No silent failures: if any error occurs (missing runtime, model, codec, GPU), show a visible error UI and write logs.
+6. Packageable for Windows (one-click run):
+
+   * Provide a build step (PyInstaller or equivalent) that produces `ControlCenter.exe`
+   * Ensure paths work when launched from shortcuts or different working dirs
+
+### Long-term product goal (architectural rebuild)
+
+This project will become an end-to-end system for a **network of fighting/grappling video clips**:
+
+* clients use mobile apps to upload training/competition clips
+* server ingests clips, extracts movement data, stores canonical features
+* creates athlete profiles + session timelines + skill evaluation
+* supports universal striking/grappling sports: boxing/kickboxing/MMA/bjj/wrestling/judo etc.
+* becomes a growing “training database” similar to Duolingo: system learns from many clips and coaching labels, improves evaluation and recommendations over time
+
+### Constraints & environment
+
+* Current processing will run locally on a Windows 11 Shadow PC for now.
+* Must keep a clean path to future cloud deployment.
+* Avoid heavy complexity until the MVP works.
+* Use best language/tool for each layer:
+
+  * GUI: keep Python for now (fast iteration), but design boundaries so GUI can later be replaced by Flutter/React Native desktop if needed.
+  * Processing engine: Python is acceptable initially (OpenCV + pose model), but design a modular “engine” that can later be rewritten in Rust/C++ for performance without changing APIs.
+  * Server: Python FastAPI (initial) is fine; later can move to Go/Rust if needed.
+  * Mobile: plan for Flutter or React Native (just scaffold and API contracts for now; do not build full mobile apps yet).
+
+---
+
+# Phase 0: Repo audit and “what is actually runnable”
+
+1. Inspect the zip contents and determine:
+
+   * whether there is an existing GUI entrypoint
+   * whether there is a packaged executable expected (`ControlCenter.exe`)
+   * how paths and logs are handled
+2. If the zip does not contain `ControlCenter.exe` (likely), implement a reliable “run from source” workflow and a “build exe” workflow.
+
+Deliverable: a top-level `RUN_LOCAL_WINDOWS.md` with exact commands for:
+
+* creating venv
+* installing deps
+* running GUI
+* building exe
+* where logs go
+
+---
+
+# Phase 1: Make the GUI unbreakable (Windows 11)
+
+Implement these design requirements:
+
+## 1.1 Strong error handling and diagnostics
+
+* Create `main_safe()` wrapper for the GUI entrypoint.
+* Hook Tk callback exception handling (or equivalent) so exceptions in callbacks don’t leave a blank window.
+* Always show either:
+
+  * the real UI, or
+  * a fallback error view with:
+
+    * error summary
+    * “Copy details”
+    * “Open logs folder”
+    * “Exit”
+* Always log:
+
+  * sys.executable, sys.version
+  * cwd, argv
+  * platform, OS build
+  * ffmpeg availability or OpenCV codec support
+  * model path resolution and whether model files exist
+
+## 1.2 No early returns that produce empty UI
+
+Audit all startup checks. Replace “return” with:
+
+* visible error message + exit non-zero if critical
+* or render a “Setup required” panel if recoverable
+
+## 1.3 Fix relative path issues
+
+All file resolution must use an `APP_BASE_DIR`:
+
+* if frozen (PyInstaller): use `sys._MEIPASS` / executable dir correctly
+* if running from source: use `Path(__file__).resolve()`
+
+---
+
+# Phase 2: Pose extraction engine (clean boundaries)
+
+You must implement a clean engine interface:
+
+## 2.1 Core interfaces
+
+Create `engine/` package with:
+
+* `PoseExtractor` interface:
+
+  * `extract(video_path) -> PoseSequence`
+* `OverlayRenderer`:
+
+  * `render(video_path, pose_sequence, out_path)`
+
+PoseSequence schema must include:
+
+* frame_index
+* timestamp_ms (or time_sec)
+* persons: list
+* keypoints: Nx( x, y, confidence )
+* optional: bbox, track_id
+
+## 2.2 Implementation choice (MVP)
+
+Implement MVP using a known pose estimator:
+
+* Prefer MediaPipe Pose (fast & easy) OR OpenPose-like model if already in repo.
+* Must run on CPU reliably on Shadow PC.
+* Must not require GPU.
+* Keep model downloads explicit and cached under an app data folder.
+
+## 2.3 Output formats
+
+Write:
+
+* `pose_tracks.json` (easy)
+* also `pose_tracks.parquet` (better for analytics) if feasible
+
+---
+
+# Phase 3: GUI features (MVP workflow)
+
+GUI must provide a single “happy path”:
+
+1. Select video
+2. Select output folder (default under LocalAppData FightingOverlay\\data\\outputs)
+3. Run Extraction
+4. Run Overlay Render
+5. Show progress + logs panel
+6. Open output folder button
+7. Show last run summary (frames processed, avg FPS, failures)
+
+Additional:
+
+* Cancel button
+* Reset state if previous run crashed
+* Make it impossible to start run without selecting a valid file
+
+---
+
+# Phase 4: Project rebuild into scalable product architecture
+
+Restructure the repo to match a future client/server system while keeping MVP intact.
+
+## 4.1 Suggested monorepo layout
+
+* `apps/desktop/` (Python GUI)
+* `engine/` (pose extraction + overlay + tracking; pure logic, no GUI dependencies)
+* `server/` (FastAPI ingestion API; not fully deployed yet)
+* `mobile/` (Flutter/React Native scaffold only; no heavy build)
+* `shared/` (schemas, canonical models, validators)
+* `infra/` (future Docker/compose scripts)
+* `docs/`
+
+## 4.2 Canonical schemas and DB plan
+
+Define a canonical “movement profile” schema:
+
+* athlete profile
+* session (training/competition)
+* clip metadata
+* extracted pose track
+* derived features (stance, guard height, step frequency, sprawl reaction time, etc.)
+* labels (coach tags) with provenance and confidence
+
+For now: implement local storage as:
+
+* filesystem for videos and outputs
+* SQLite (or DuckDB) for metadata + indexing
+* Parquet for pose tracks/features
+
+## 4.3 Future upload pipeline (scaffold only)
+
+Implement server endpoints (FastAPI):
+
+* POST /clips (upload metadata)
+* PUT /clips/{id}/file (upload clip file)
+* POST /clips/{id}/process (enqueue processing)
+* GET /clips/{id}/status
+* GET /athletes/{id}/profile
+
+You do NOT need a full auth system yet, but design for it:
+
+* API keys for now
+* later OAuth/JWT
+
+---
+
+# Phase 5: Packaging and release automation
+
+Provide:
+
+* `scripts/build_windows.ps1` builds `ControlCenter.exe`
+* include all required model files or implement first-run model download with checksum
+* write logs to `%LOCALAPPDATA%\\FightingOverlay\\logs`
+* ensure a clean “portable” run mode is possible too
+
+Add a `--ui-smoke-test` option:
+
+* creates a hidden root window
+* initializes UI + engine
+* returns 0 if okay, non-zero if not
+
+---
+
+# Implementation rules (important)
+
+* Keep dependencies minimal and well-documented.
+* Do not hide exceptions.
+* Prefer explicit error messages over guessing.
+* Every module must have clear responsibility.
+* All I/O should go through a `paths.py` that supports frozen + source modes.
+* Include type hints.
+
+---
+
+# Deliverables checklist
+
+1. Working GUI from source on Windows 11
+2. `ControlCenter.exe` build script + documentation
+3. Pose extraction + overlay output verified
+4. Structured project layout ready for future mobile/server
+5. FastAPI scaffold with canonical schemas for future uploads
+6. Smoke tests and basic unit tests for engine components
+7. Clear docs: RUN_LOCAL_WINDOWS.md + TROUBLESHOOTING.md
+
+Now implement. Start by making the MVP run end-to-end, then refactor into the new structure without breaking it.
+
+---
+
+## A couple of specifics I’d want you (Jackson) to answer (only if you know; not required to proceed)
+
+If you can answer these, it will improve the “from the ground up” choices, but Codex can still proceed without them:
+
+1. Do you want **single-person pose only** for now, or **multi-person tracking** in the same clip?
+2. Are most clips **phone portrait**, **landscape**, or mixed?
+3. Do you prefer **MediaPipe** (fast CPU) or are you committed to a specific model already in the repo?
+
+If you don’t answer, Codex should default to: **single-person + mixed orientation + MediaPipe Pose CPU** for MVP.
+
+---
+
+If you paste Codex’s output (summary + file tree + key diffs + run logs), I’ll grade it hard on:
+
+* does the GUI launch reliably?
+* does it actually produce pose_tracks + overlay?
+* is the architecture clean enough to scale without a rewrite?
