@@ -42,7 +42,7 @@ from core.paths import (
     get_update_history_path,
 )
 from core.pipeline import ProcessingCancelled, ProcessingOptions, run_pipeline
-from core.settings import load_settings, save_settings
+from core.settings import apply_setting_change, load_settings, safe_float, safe_int, save_settings
 from core.schema import validate_pose_tracks_schema
 
 RELEASES_URL = "https://api.github.com/repos/CheeseTheWheeze/FightingOverlay/releases/latest"
@@ -477,6 +477,28 @@ def main() -> None:
         "ui_font_size": 12,
     }
     settings = load_settings(defaults)
+    sanitized = False
+    sanitized_scale = safe_float(
+        ("ui_scale_multiplier", settings.get("ui_scale_multiplier")),
+        defaults["ui_scale_multiplier"],
+        min_value=0.5,
+        max_value=2.5,
+    )
+    if sanitized_scale != settings.get("ui_scale_multiplier"):
+        settings["ui_scale_multiplier"] = sanitized_scale
+        sanitized = True
+    sanitized_font = safe_int(
+        ("ui_font_size", settings.get("ui_font_size")),
+        defaults["ui_font_size"],
+        min_value=9,
+        max_value=32,
+    )
+    if sanitized_font != settings.get("ui_font_size"):
+        settings["ui_font_size"] = sanitized_font
+        sanitized = True
+    if sanitized:
+        save_settings(settings)
+        logging.warning("Sanitized invalid settings values; wrote corrected values.")
     sync_update_history()
 
     if args.test_mode:
@@ -491,11 +513,23 @@ def main() -> None:
         return
 
     root = Tk()
-    scale = get_ui_scale(root) * float(settings.get("ui_scale_multiplier", 1.0))
+    scale_multiplier = safe_float(
+        ("ui_scale_multiplier", settings.get("ui_scale_multiplier")),
+        defaults["ui_scale_multiplier"],
+        min_value=0.5,
+        max_value=2.5,
+    )
+    scale = get_ui_scale(root) * scale_multiplier
     reference_scale = get_reference_scale()
     root.tk.call("tk", "scaling", scale)
     base_font = tkfont.nametofont("TkDefaultFont")
-    base_font_size = max(9, int(float(settings.get("ui_font_size", 12)) * (scale / reference_scale)))
+    font_size_setting = safe_int(
+        ("ui_font_size", settings.get("ui_font_size")),
+        defaults["ui_font_size"],
+        min_value=9,
+        max_value=32,
+    )
+    base_font_size = max(9, int(font_size_setting * (scale / reference_scale)))
     base_font.configure(size=base_font_size)
     theme = configure_dark_theme(root, scale)
     root.title("FightingOverlay Control Center")
@@ -545,8 +579,8 @@ def main() -> None:
     smoothing_alpha_var = DoubleVar(value=float(settings.get("smoothing_alpha") or 0.7))
     min_conf_var = DoubleVar(value=float(settings.get("confidence_threshold") or 0.3))
     tracking_backend_var = StringVar(value=str(settings.get("tracking_backend")))
-    ui_scale_var = DoubleVar(value=float(settings.get("ui_scale_multiplier", 1.0)))
-    ui_font_size_var = IntVar(value=int(settings.get("ui_font_size", 12)))
+    ui_scale_var = DoubleVar(value=scale_multiplier)
+    ui_font_size_var = IntVar(value=font_size_setting)
 
     cancel_event = threading.Event()
 
@@ -586,8 +620,14 @@ def main() -> None:
 
     notebook = ttk.Notebook(container)
     paned_main = ttk.Panedwindow(container, orient="vertical")
+    logging.info("UI_BUILD paned_widget=%s tk_class=%s", type(paned_main).__name__, paned_main.winfo_class())
     paned_main.grid(row=2, column=0, sticky="nsew")
-    paned_main.add(notebook, weight=4)
+    try:
+        paned_main.add(notebook, weight=4)
+    except TclError as exc:
+        logging.exception("UI_BUILD pane configuration failed")
+        paned_main.grid_remove()
+        notebook.grid(row=2, column=0, sticky="nsew")
 
     run_tab, run_content = create_scrollable_tab(notebook, theme)
     data_tab, data_content = create_scrollable_tab(notebook, theme)
@@ -675,15 +715,27 @@ def main() -> None:
             open_path(Path(report_path))
 
     dev_pane = ttk.Panedwindow(dev_tab, orient="horizontal")
+    logging.info("UI_BUILD paned_widget=%s tk_class=%s", type(dev_pane).__name__, dev_pane.winfo_class())
     dev_pane.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
 
     dev_left_panel, dev_left_content = create_scrollable_panel(dev_pane, theme)
     dev_center_panel, dev_center_content = create_scrollable_panel(dev_pane, theme)
     dev_right_panel, dev_right_content = create_scrollable_panel(dev_pane, theme)
 
-    dev_pane.add(dev_left_panel, weight=1)
-    dev_pane.add(dev_center_panel, weight=2)
-    dev_pane.add(dev_right_panel, weight=1)
+    try:
+        dev_pane.add(dev_left_panel, weight=1)
+        dev_pane.add(dev_center_panel, weight=2)
+        dev_pane.add(dev_right_panel, weight=1)
+    except TclError:
+        logging.exception("UI_BUILD pane configuration failed")
+        dev_pane.grid_remove()
+        dev_left_panel.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        dev_center_panel.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
+        dev_right_panel.grid(row=0, column=2, sticky="nsew", padx=8, pady=8)
+        dev_tab.columnconfigure(0, weight=1)
+        dev_tab.columnconfigure(1, weight=2)
+        dev_tab.columnconfigure(2, weight=1)
+        dev_tab.rowconfigure(0, weight=1)
 
     ttk.Label(dev_left_content, text="Inputs & Run", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
     ttk.Label(dev_left_content, textvariable=selected_video, style="Card.TLabel").grid(
@@ -1639,16 +1691,11 @@ def main() -> None:
     log_scroll.grid(row=0, column=1, sticky="ns")
     log_text.configure(yscrollcommand=log_scroll.set)
     bind_mousewheel(log_text)
-    paned_main.add(log_frame, weight=1)
     try:
-        paned_main.pane(log_frame, minsize=0)
-    except TclError as exc:
-        logging.exception(
-            "Failed to configure paned window for logs (widget=%s, options=%s): %s",
-            paned_main.winfo_class(),
-            {"minsize": 0},
-            exc,
-        )
+        paned_main.add(log_frame, weight=1, minsize=0)
+    except TclError:
+        logging.exception("UI_BUILD pane configuration failed")
+        log_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
 
     handler = TkTextHandler(log_text, root)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -1691,11 +1738,25 @@ def main() -> None:
         save_settings(settings)
 
     def bind_setting(var, key: str, cast=None) -> None:
+        last_good = settings.get(key, defaults.get(key))
+
         def _on_change(*_args: object) -> None:
+            nonlocal last_good
             value = var.get()
-            if cast:
-                value = cast(value)
-            save_setting(key, value)
+            new_value, saved = apply_setting_change(
+                value,
+                key=key,
+                cast=cast,
+                last_good=last_good,
+                save=lambda updated: save_setting(key, updated),
+            )
+            if not saved:
+                try:
+                    var.set(last_good)
+                except Exception:
+                    logging.exception("Failed to reset %s to last good value", key)
+                return
+            last_good = new_value
 
         var.trace_add("write", _on_change)
 
@@ -1719,8 +1780,26 @@ def main() -> None:
     bind_setting(foreground_mode_var, "foreground_mode", str)
     bind_setting(manual_tracks_var, "manual_track_ids", str)
     bind_setting(update_channel_var, "update_channel", str)
-    bind_setting(ui_scale_var, "ui_scale_multiplier", float)
-    bind_setting(ui_font_size_var, "ui_font_size", int)
+    bind_setting(
+        ui_scale_var,
+        "ui_scale_multiplier",
+        lambda value: safe_float(
+            ("ui_scale_multiplier", value),
+            defaults["ui_scale_multiplier"],
+            min_value=0.5,
+            max_value=2.5,
+        ),
+    )
+    bind_setting(
+        ui_font_size_var,
+        "ui_font_size",
+        lambda value: safe_int(
+            ("ui_font_size", value),
+            defaults["ui_font_size"],
+            min_value=9,
+            max_value=32,
+        ),
+    )
 
     def clamp_max_tracks() -> None:
         try:
