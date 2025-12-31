@@ -2249,8 +2249,9 @@ def run_pipeline(
     cancel_event: object | None = None,
     status_callback: StatusCallback | None = None,
     info_callback: InfoCallback | None = None,
+    output_dir: Path | None = None,
 ) -> Path:
-    output_dir = get_outputs_root()
+    output_dir = output_dir or get_outputs_root()
     current_step = "start"
     overlay_stats: dict[str, object] | None = None
     evaluation_stats: dict[str, object] | None = None
