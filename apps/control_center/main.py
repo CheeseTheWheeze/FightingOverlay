@@ -5,8 +5,10 @@ import base64
 from collections import deque
 import json
 import logging
+import os
 import shutil
 import subprocess
+import sys
 import threading
 import traceback
 import urllib.error
@@ -14,6 +16,7 @@ import urllib.request
 import webbrowser
 from datetime import datetime
 from pathlib import Path
+import tkinter as tk
 from tkinter import (
     BooleanVar,
     Canvas,
@@ -443,6 +446,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.ui_smoke_test:
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if sys.platform != "win32" or not local_appdata:
+            print("Skipped: UI smoke test requires Windows LOCALAPPDATA.")
+            raise SystemExit(0)
+
     setup_logging()
     if not check_opencv(show_dialog=not args.test_mode):
         return
@@ -624,7 +633,7 @@ def main() -> None:
     paned_main.grid(row=2, column=0, sticky="nsew")
     try:
         paned_main.add(notebook, weight=4)
-    except TclError as exc:
+    except tk.TclError as exc:
         logging.exception("UI_BUILD pane configuration failed")
         paned_main.grid_remove()
         notebook.grid(row=2, column=0, sticky="nsew")
@@ -726,7 +735,7 @@ def main() -> None:
         dev_pane.add(dev_left_panel, weight=1)
         dev_pane.add(dev_center_panel, weight=2)
         dev_pane.add(dev_right_panel, weight=1)
-    except TclError:
+    except tk.TclError as exc:
         logging.exception("UI_BUILD pane configuration failed")
         dev_pane.grid_remove()
         dev_left_panel.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
@@ -1692,8 +1701,8 @@ def main() -> None:
     log_text.configure(yscrollcommand=log_scroll.set)
     bind_mousewheel(log_text)
     try:
-        paned_main.add(log_frame, weight=1, minsize=0)
-    except TclError:
+        paned_main.add(log_frame, weight=1)
+    except tk.TclError as exc:
         logging.exception("UI_BUILD pane configuration failed")
         log_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
 
@@ -2104,7 +2113,7 @@ def main() -> None:
         try:
             root.update_idletasks()
             root.update()
-        except TclError as exc:
+        except tk.TclError as exc:
             logging.exception("UI smoke test failed: %s", exc)
             raise SystemExit(1) from exc
         finally:
