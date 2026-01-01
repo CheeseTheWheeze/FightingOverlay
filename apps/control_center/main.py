@@ -30,6 +30,7 @@ from tkinter import (
     Tk,
     filedialog,
     messagebox,
+    simpledialog,
     ttk,
 )
 import tkinter.font as tkfont
@@ -40,15 +41,20 @@ from core.paths import (
     get_codex_packets_root,
     get_current_pointer,
     get_data_root,
+    get_db_path,
     get_last_update_path,
     get_log_root,
     get_outputs_root,
+    get_profile_root,
     get_sent_codex_packets_root,
     get_update_history_path,
 )
-from core.pipeline import ProcessingCancelled, ProcessingOptions, run_pipeline
 from core.settings import apply_setting_change, load_settings, safe_float, safe_int, save_settings
 from core.schema import validate_pose_tracks_schema
+from core.storage import copy_source_to_clip, detect_legacy_outputs, ensure_clip_dir, ensure_data_layout
+from db.index import add_artifact, create_athlete, create_clip, get_or_create_athlete, init_db, list_athletes
+from engine.processing import ClipProcessingConfig, process_clip
+from core.pipeline import ProcessingCancelled
 
 RELEASES_URL = "https://api.github.com/repos/CheeseTheWheeze/FightingOverlay/releases/latest"
 
@@ -110,8 +116,15 @@ class FilteredTkTextHandler(logging.Handler):
         self.text_widget.configure(state="disabled")
 
 
+def get_log_root_safe() -> Path:
+    try:
+        return get_log_root()
+    except RuntimeError:
+        return Path.cwd() / "logs"
+
+
 def setup_logging() -> Path:
-    log_root = get_log_root()
+    log_root = get_log_root_safe()
     log_root.mkdir(parents=True, exist_ok=True)
     log_path = log_root / "control_center.log"
     logging.basicConfig(
@@ -120,6 +133,31 @@ def setup_logging() -> Path:
         handlers=[logging.FileHandler(log_path, encoding="utf-8")],
     )
     return log_path
+
+
+def write_crash_log(exc: BaseException, log_root: Path) -> Path:
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    crash_path = log_root / f"crash_{timestamp}.log"
+    log_root.mkdir(parents=True, exist_ok=True)
+    diagnostics = build_diagnostics_payload(crash_path)
+    stack = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    crash_path.write_text(
+        "\n".join(
+            [
+                f"timestamp_utc={timestamp}",
+                f"exception_type={type(exc).__name__}",
+                f"exception_message={exc}",
+                "",
+                "TRACEBACK",
+                stack,
+                "",
+                "DIAGNOSTICS",
+                diagnostics,
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return crash_path
 
 
 def build_diagnostics_payload(log_path: Path, cv2_version: str | None = None) -> str:
@@ -234,7 +272,7 @@ def show_fatal_error_ui(root: Tk, title: str, message: str, details: str, log_pa
     actions.columnconfigure(2, weight=1)
 
     def on_open_logs() -> None:
-        open_folder(get_log_root())
+        open_folder(get_log_root_safe())
 
     def on_copy_details() -> None:
         root.clipboard_clear()
@@ -303,14 +341,26 @@ def get_current_version() -> str:
 
 
 def open_folder(path: Path) -> None:
-    subprocess.run(["explorer", str(path)], check=False)
+    try:
+        if os.name == "nt":
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        else:
+            subprocess.run(["xdg-open", str(path)], check=False)
+    except Exception as exc:
+        logging.warning("Failed to open folder %s: %s", path, exc)
 
 
 def open_path(path: Path) -> None:
     if path.is_dir():
         open_folder(path)
-    else:
-        subprocess.run(["explorer", str(path)], check=False)
+        return
+    try:
+        if os.name == "nt":
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        else:
+            subprocess.run(["xdg-open", str(path)], check=False)
+    except Exception as exc:
+        logging.warning("Failed to open path %s: %s", path, exc)
 
 
 def fetch_latest_release() -> dict:
@@ -393,8 +443,9 @@ def load_last_update() -> str:
         return "Update log unreadable"
 
 
-def validate_output_schema() -> tuple[bool, str]:
-    output_path = get_outputs_root() / "pose_tracks.json"
+def validate_output_schema(output_root: Path | None = None) -> tuple[bool, str]:
+    root = output_root or get_outputs_root()
+    output_path = root / "pose_tracks.json"
     if not output_path.exists():
         return False, "pose_tracks.json not found in outputs folder."
     try:
@@ -644,6 +695,7 @@ def main() -> int:
         "manual_track_ids": "",
         "last_video_path": "",
         "last_output_path": str(get_outputs_root()),
+        "last_athlete_id": "",
         "update_channel": "Stable",
         "last_update_check": "",
         "last_selected_tab": "Run / Processing",
@@ -674,15 +726,20 @@ def main() -> int:
         save_settings(settings)
         logging.warning("Sanitized invalid settings values; wrote corrected values.")
     sync_update_history()
+    if os.environ.get("LOCALAPPDATA"):
+        ensure_data_layout()
+        init_db()
+    else:
+        logging.warning("LOCALAPPDATA missing; skipping data layout and DB init.")
 
     if args.test_mode:
-        options = ProcessingOptions(
+        config = ClipProcessingConfig(
             export_overlay_video=False,
             save_pose_json=True,
             save_thumbnails=False,
             save_background_tracks=True,
         )
-        run_pipeline(None, options)
+        process_clip(None, output_dir=get_outputs_root(), config=config)
         logging.info("Control Center test mode completed")
         return 0
 
@@ -693,14 +750,34 @@ def main() -> int:
         if fatal_ui_shown["value"]:
             return
         fatal_ui_shown["value"] = True
-        details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        crash_path = write_crash_log(exc, get_log_root_safe())
+        diagnostics = build_diagnostics_payload(log_path)
+        details = "\n".join(
+            [
+                f"Crash log: {crash_path}",
+                diagnostics,
+                "",
+                "Traceback:",
+                "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+            ]
+        )
         logging.error("%s: %s", title, message, exc_info=exc)
         show_fatal_error_ui(root, title, message, details, log_path)
 
     def _report_callback_exception(exc_type: type[BaseException], exc: BaseException, tb: object) -> None:
         if fatal_ui_shown["value"]:
             return
-        details = "".join(traceback.format_exception(exc_type, exc, tb))
+        crash_path = write_crash_log(exc, get_log_root_safe())
+        diagnostics = build_diagnostics_payload(log_path)
+        details = "\n".join(
+            [
+                f"Crash log: {crash_path}",
+                diagnostics,
+                "",
+                "Traceback:",
+                "".join(traceback.format_exception(exc_type, exc, tb)),
+            ]
+        )
         logging.error("Unhandled Tk callback exception", exc_info=(exc_type, exc, tb))
         show_fatal_error_ui(
             root,
@@ -738,6 +815,8 @@ def main() -> int:
     
         last_video = settings.get("last_video_path") or ""
         selected_video = StringVar(value=last_video if last_video else "No video selected")
+        athlete_display_var = StringVar(value="No athlete selected")
+        selected_athlete_id = StringVar(value=str(settings.get("last_athlete_id") or ""))
         status_var = StringVar(value="Idle")
         run_stage_var = StringVar(value="Idle")
         frame_stats_var = StringVar(value="Frame -/-")
@@ -781,8 +860,48 @@ def main() -> int:
         tracking_backend_var = StringVar(value=str(settings.get("tracking_backend")))
         ui_scale_var = DoubleVar(value=scale_multiplier)
         ui_font_size_var = IntVar(value=font_size_setting)
-    
+
         cancel_event = threading.Event()
+
+        athlete_display_map: dict[str, str] = {}
+
+        def refresh_athlete_choices() -> None:
+            athlete_display_map.clear()
+            profiles = list_athletes()
+            choices: list[str] = []
+            for profile in profiles:
+                label = f"{profile.name} ({profile.id})"
+                athlete_display_map[label] = profile.id
+                choices.append(label)
+            athlete_combo.configure(values=choices)  # type: ignore[name-defined]
+            current_id = selected_athlete_id.get()
+            current_label = next((label for label, aid in athlete_display_map.items() if aid == current_id), None)
+            if current_label:
+                athlete_display_var.set(current_label)
+            elif choices:
+                athlete_display_var.set(choices[0])
+                selected_athlete_id.set(athlete_display_map[choices[0]])
+            else:
+                athlete_display_var.set("No athlete selected")
+                selected_athlete_id.set("")
+
+        def create_new_athlete() -> None:
+            name = simpledialog.askstring("New Athlete", "Athlete name:", parent=root)
+            if not name:
+                return
+            profile = create_athlete(name.strip())
+            selected_athlete_id.set(profile.id)
+            settings["last_athlete_id"] = profile.id
+            save_settings(settings)
+            refresh_athlete_choices()
+
+        def on_athlete_selected(_event: object) -> None:
+            label = athlete_display_var.get()
+            athlete_id = athlete_display_map.get(label, "")
+            if athlete_id:
+                selected_athlete_id.set(athlete_id)
+                settings["last_athlete_id"] = athlete_id
+                save_settings(settings)
     
         if overlay_mode_var.get() not in OVERLAY_OPTIONS:
             overlay_mode_var.set("Skeleton overlay")
@@ -844,10 +963,10 @@ def main() -> int:
             diagnostics_text = build_diagnostics_payload(log_path, cv2_version)
     
         def on_open_outputs() -> None:
-            open_folder(get_outputs_root())
+            open_folder(current_output_root())
     
         def on_open_logs() -> None:
-            open_folder(get_log_root())
+            open_folder(get_log_root_safe())
     
         def on_select_data_directory() -> None:
             selected_dir = filedialog.askdirectory(
@@ -859,6 +978,49 @@ def main() -> int:
                 save_settings(settings)
                 open_folder(Path(selected_dir))
                 logging.info("Selected data directory: %s", selected_dir)
+
+        legacy_status_var = StringVar(value="")
+        legacy_info = detect_legacy_outputs()
+
+        def refresh_legacy_status() -> None:
+            nonlocal legacy_info
+            legacy_info = detect_legacy_outputs()
+            if legacy_info:
+                legacy_status_var.set(f"Legacy outputs detected at {legacy_info.root}")
+            else:
+                legacy_status_var.set("No legacy outputs detected.")
+
+        def import_legacy_outputs() -> None:
+            nonlocal legacy_info
+            legacy_info = detect_legacy_outputs()
+            if not legacy_info:
+                messagebox.showinfo("Import Legacy Outputs", "No legacy outputs found to import.")
+                return
+            profile = get_or_create_athlete("Legacy Import")
+            clip = create_clip(profile.id, source_path=str(legacy_info.root))
+            clip_dir = ensure_clip_dir(profile.id, clip.id)
+            imported = []
+            if legacy_info.pose_path:
+                destination = clip_dir / legacy_info.pose_path.name
+                shutil.copy2(legacy_info.pose_path, destination)
+                add_artifact(clip.id, "pose_json", str(destination))
+                imported.append(destination)
+            if legacy_info.overlay_path:
+                destination = clip_dir / legacy_info.overlay_path.name
+                shutil.copy2(legacy_info.overlay_path, destination)
+                add_artifact(clip.id, "overlay_video", str(destination))
+                imported.append(destination)
+            if imported:
+                settings["last_output_path"] = str(clip_dir)
+                settings["last_athlete_id"] = profile.id
+                save_settings(settings)
+                refresh_legacy_status()
+                messagebox.showinfo(
+                    "Import Legacy Outputs",
+                    f"Imported {len(imported)} files into {clip_dir}.",
+                )
+            else:
+                messagebox.showinfo("Import Legacy Outputs", "No legacy files were copied.")
     
         notebook.add(run_tab, text="Run / Processing")
         notebook.add(data_tab, text="Data & Storage")
@@ -964,12 +1126,25 @@ def main() -> int:
         notebook.bind("<<NotebookTabChanged>>", on_tab_changed)
     
         run_content.columnconfigure(1, weight=1)
-        run_content.rowconfigure(5, weight=1)
         run_content.rowconfigure(6, weight=1)
-    
-        ttk.Label(run_content, text="Source Video", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
+        run_content.rowconfigure(7, weight=1)
+
+        athlete_frame = ttk.Frame(run_content, padding=8, style="Card.TFrame")
+        athlete_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        athlete_frame.columnconfigure(1, weight=1)
+        ttk.Label(athlete_frame, text="Athlete Profile", style="Subheader.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        athlete_combo = ttk.Combobox(athlete_frame, textvariable=athlete_display_var, state="readonly")
+        athlete_combo.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        athlete_new_button = ttk.Button(athlete_frame, text="New athlete", command=create_new_athlete)
+        athlete_new_button.grid(row=0, column=2, sticky="e")
+        athlete_combo.bind("<<ComboboxSelected>>", on_athlete_selected)
+        refresh_athlete_choices()
+
+        ttk.Label(run_content, text="Source Video", style="Subheader.TLabel").grid(row=1, column=0, sticky="w")
         ttk.Label(run_content, textvariable=selected_video, style="Card.TLabel").grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(4, 12)
+            row=2, column=0, columnspan=2, sticky="w", pady=(4, 12)
         )
     
         def on_open_video() -> None:
@@ -993,7 +1168,7 @@ def main() -> int:
             nonlocal dev_artifacts_list
             if dev_artifacts_list is None:
                 return
-            output_root = get_outputs_root()
+            output_root = current_output_root()
             entries = []
             if output_root.exists():
                 entries = sorted([path.name for path in output_root.iterdir()])
@@ -1007,7 +1182,7 @@ def main() -> int:
             selection = dev_artifacts_list.curselection()
             if not selection:
                 return
-            output_root = get_outputs_root()
+            output_root = current_output_root()
             name = dev_artifacts_list.get(selection[0])
             open_path(output_root / name)
     
@@ -1136,7 +1311,7 @@ def main() -> int:
             pending_count_var.set(f"Pending packets: {len(pending_paths)}")
     
         def build_debug_pack_status() -> dict[str, object]:
-            output_root = get_outputs_root()
+            output_root = current_output_root()
             manifest = load_debug_pack_manifest(output_root)
             latest_pack = get_latest_debug_pack_dir(output_root)
             file_count = len(list(latest_pack.glob("*"))) if latest_pack else 0
@@ -1239,7 +1414,7 @@ def main() -> int:
             return path
     
         def write_codex_packet_text(packet: dict[str, object]) -> Path:
-            output_dir = get_outputs_root()
+            output_dir = current_output_root()
             output_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             path = output_dir / f"codex_fix_packet_{timestamp}.txt"
@@ -1290,7 +1465,7 @@ def main() -> int:
             ]
             prompt_text = "\n".join(prompt_lines)
             copy_to_clipboard(prompt_text)
-            output_dir = get_outputs_root()
+            output_dir = current_output_root()
             output_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             prompt_path = output_dir / f"codex_pending_prompt_{timestamp}.txt"
@@ -1309,10 +1484,16 @@ def main() -> int:
     
         def overlay_slug(label: str) -> str:
             return OVERLAY_OPTIONS.get(label, OVERLAY_OPTIONS["Skeleton overlay"])["slug"]
+
+        def current_output_root() -> Path:
+            last_path = settings.get("last_output_path") or ""
+            if last_path:
+                return Path(last_path)
+            return get_outputs_root()
     
         def overlay_file(label: str) -> Path:
             filename = OVERLAY_OPTIONS.get(label, OVERLAY_OPTIONS["Skeleton overlay"])["file"]
-            return get_outputs_root() / filename
+            return current_output_root() / filename
     
         def refresh_update_history_list() -> None:
             history = load_update_history()
@@ -1463,7 +1644,7 @@ def main() -> int:
                 messagebox.showinfo("Updates", "No release notes URL available yet.")
     
         def on_validate() -> None:
-            ok, message = validate_output_schema()
+            ok, message = validate_output_schema(current_output_root())
             if ok:
                 messagebox.showinfo("Validate Output", message)
             else:
@@ -1476,7 +1657,7 @@ def main() -> int:
         processing_state = {"running": False}
     
         run_actions = ttk.Frame(run_content)
-        run_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        run_actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         run_actions.columnconfigure(0, weight=1)
         run_actions.columnconfigure(1, weight=1)
     
@@ -1507,7 +1688,7 @@ def main() -> int:
         action_buttons.extend([open_button, run_button, advanced_toggle, dev_open_button, dev_run_button])
     
         advanced_frame = ttk.Frame(run_content, padding=12, style="Card.TFrame")
-        advanced_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        advanced_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 12))
         advanced_frame.columnconfigure(0, weight=1)
         advanced_frame.columnconfigure(1, weight=1)
         advanced_frame.grid_remove()
@@ -1658,7 +1839,7 @@ def main() -> int:
         reset_button.grid(row=15, column=1, sticky="e", pady=(6, 0))
     
         quick_actions = ttk.Frame(run_content, padding=8, style="Card.TFrame")
-        quick_actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        quick_actions.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         quick_actions.columnconfigure(0, weight=1)
         quick_actions.columnconfigure(1, weight=1)
     
@@ -1668,7 +1849,7 @@ def main() -> int:
         quick_logs.grid(row=0, column=1, sticky="ew")
     
         status_frame = ttk.Frame(run_content, padding=12, style="Card.TFrame")
-        status_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(16, 8))
+        status_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(16, 8))
         status_frame.columnconfigure(1, weight=1)
     
         ttk.Label(status_frame, text="Run Status", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
@@ -1713,7 +1894,7 @@ def main() -> int:
         )
     
         preview_frame = ttk.Frame(run_content, padding=12, style="Card.TFrame")
-        preview_frame.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
+        preview_frame.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
         preview_frame.columnconfigure(0, weight=1)
     
         ttk.Label(preview_frame, text="Live Preview", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
@@ -1723,7 +1904,7 @@ def main() -> int:
         preview_label.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
     
         output_frame = ttk.Frame(run_content, padding=12, style="Card.TFrame")
-        output_frame.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
+        output_frame.grid(row=7, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
         output_frame.columnconfigure(1, weight=1)
     
         ttk.Label(output_frame, text="Results Viewer", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
@@ -1833,7 +2014,7 @@ def main() -> int:
         overlay_mode_var.trace_add("write", lambda *_: load_viewer_video())
     
         problems_frame = ttk.Frame(run_content, padding=12, style="Card.TFrame")
-        problems_frame.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        problems_frame.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         problems_frame.columnconfigure(0, weight=1)
     
         ttk.Label(problems_frame, text="Problems", style="Subheader.TLabel").grid(row=0, column=0, sticky="w")
@@ -1843,7 +2024,7 @@ def main() -> int:
         bind_mousewheel(problems_list)
     
         codex_frame = ttk.Frame(run_content, padding=12, style="Card.TFrame")
-        codex_frame.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        codex_frame.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         codex_frame.columnconfigure(0, weight=1)
         codex_frame.columnconfigure(1, weight=1)
         codex_frame.columnconfigure(2, weight=1)
@@ -1883,9 +2064,19 @@ def main() -> int:
         data_group.grid(row=0, column=0, sticky="ew")
         ttk.Label(data_group, text=f"Outputs: {get_outputs_root()}").grid(row=0, column=0, sticky="w")
         ttk.Label(data_group, text=f"Logs: {get_log_root()}").grid(row=1, column=0, sticky="w")
+        ttk.Label(data_group, text=f"DB: {get_db_path()}").grid(row=2, column=0, sticky="w")
+
+        legacy_group = ttk.LabelFrame(data_content, text="Legacy Outputs", padding=12)
+        legacy_group.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        legacy_group.columnconfigure(0, weight=1)
+        ttk.Label(legacy_group, textvariable=legacy_status_var, style="Card.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        legacy_import_button = ttk.Button(legacy_group, text="Import legacy outputs", command=import_legacy_outputs)
+        legacy_import_button.grid(row=1, column=0, sticky="w", pady=(6, 0))
     
         data_actions = ttk.Frame(data_content, padding=12, style="Card.TFrame")
-        data_actions.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        data_actions.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         data_actions.columnconfigure(0, weight=1)
         data_actions.columnconfigure(1, weight=1)
     
@@ -1893,6 +2084,7 @@ def main() -> int:
         logs_button = ttk.Button(data_actions, text="Open Logs", command=on_open_logs)
         outputs_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         logs_button.grid(row=0, column=1, sticky="ew")
+        refresh_legacy_status()
     
         settings_content.columnconfigure(0, weight=1)
     
@@ -2276,9 +2468,11 @@ def main() -> int:
             if not Path(selected_video.get()).exists():
                 messagebox.showerror("Run Overlay", "Selected video file does not exist.")
                 return
+            if not selected_athlete_id.get():
+                messagebox.showwarning("Run Overlay", "Please select or create an athlete profile first.")
+                return
     
             settings["last_video_path"] = selected_video.get()
-            settings["last_output_path"] = str(get_outputs_root())
             save_settings(settings)
     
             cancel_event.clear()
@@ -2318,6 +2512,7 @@ def main() -> int:
     
             def run_background() -> None:
                 run_status = "success"
+                clip_dir: Path | None = None
                 try:
                     mode = foreground_mode_var.get()
                     if mode != "Auto (closest/most active)":
@@ -2327,9 +2522,26 @@ def main() -> int:
                         root.after(0, messagebox.showwarning, "Run Overlay", "Enter track IDs for Manual pick mode.")
                         root.after(0, set_running, False)
                         return
+                    athlete_id = selected_athlete_id.get()
+                    if not athlete_id:
+                        root.after(0, messagebox.showwarning, "Run Overlay", "Select an athlete profile before running.")
+                        root.after(0, set_running, False)
+                        return
+                    source_path = Path(selected_video.get())
+                    clip = create_clip(athlete_id, source_path=str(source_path))
+                    clip_dir = ensure_clip_dir(athlete_id, clip.id)
+                    source_copy = copy_source_to_clip(clip_dir, source_path)
+                    add_artifact(
+                        clip.id,
+                        "source_video",
+                        str(source_copy),
+                        meta={"original_path": str(source_path)},
+                    )
+                    settings["last_output_path"] = str(clip_dir)
+                    save_settings(settings)
                     overlay_mode = overlay_slug(overlay_mode_var.get())
                     track_sort = "stability"
-                    options = ProcessingOptions(
+                    config = ClipProcessingConfig(
                         export_overlay_video=export_overlay_var.get(),
                         save_pose_json=save_pose_var.get(),
                         save_combat_overlay=save_combat_var.get(),
@@ -2350,13 +2562,28 @@ def main() -> int:
                         tracking_backend=tracking_backend_var.get(),
                         manual_track_ids=manual_ids,
                     )
-                    pose_path = run_pipeline(
-                        Path(selected_video.get()),
-                        options,
-                        cancel_event,
-                        status_callback,
-                        info_callback,
+                    pose_path = process_clip(
+                        source_path,
+                        output_dir=clip_dir,
+                        config=config,
+                        cancel_event=cancel_event,
+                        status_callback=status_callback,
+                        info_callback=info_callback,
                     )
+                    if pose_path.exists():
+                        add_artifact(clip.id, "pose_json", str(pose_path))
+                    artifact_candidates = {
+                        "overlay_video": clip_dir / "overlay.mp4",
+                        "overlay_skeleton": clip_dir / "overlay_skeleton.mp4",
+                        "overlay_joints": clip_dir / "overlay_joints.mp4",
+                        "overlay_balance": clip_dir / "overlay_balance.mp4",
+                        "overlay_combat": clip_dir / "overlay_combat.mp4",
+                        "overlay_debug": clip_dir / "overlay_debug.mp4",
+                        "combat_overlay": clip_dir / "combat_overlay.json",
+                    }
+                    for kind, path in artifact_candidates.items():
+                        if path.exists():
+                            add_artifact(clip.id, kind, str(path))
                     logging.info("Processing finished. Output: %s", pose_path)
                     root.after(0, load_viewer_video)
                     root.after(0, messagebox.showinfo, "Run Overlay", "Processing complete.")
@@ -2370,7 +2597,13 @@ def main() -> int:
                     run_status = "failed"
                     run_state["stack_trace"] = traceback.format_exc()
                     root.after(0, update_info, {"error": exc, "stage": "Failed"})
-                    root.after(0, messagebox.showerror, "Run Overlay", f"Processing failed: {exc}")
+                    log_root = get_log_root_safe()
+                    root.after(
+                        0,
+                        messagebox.showerror,
+                        "Run Overlay",
+                        f"Processing failed: {exc}\n\nLogs: {log_root}",
+                    )
                     root.after(0, update_status, "Processing failed.", 0)
                 finally:
                     if run_status in {"success", "failed"}:
@@ -2393,7 +2626,7 @@ def main() -> int:
         run_button.configure(command=on_run_overlay)
     
         validate_button = ttk.Button(run_content, text="Validate Output JSON schema", command=on_validate)
-        validate_button.grid(row=9, column=0, sticky="w", pady=(6, 0))
+        validate_button.grid(row=11, column=0, sticky="w", pady=(6, 0))
     
         action_buttons.append(validate_button)
     
@@ -2405,7 +2638,8 @@ def main() -> int:
         if args.ui_smoke_test:
             try:
                 root.update_idletasks()
-                root.update()
+                root.after(400, root.quit)
+                root.mainloop()
             except tk.TclError as exc:
                 logging.exception("UI smoke test failed: %s", exc)
                 return 1
@@ -2435,20 +2669,38 @@ def main_safe() -> int:
     try:
         return main()
     except Exception as exc:
-        log_path = get_log_root() / "control_center.log"
+        log_root = get_log_root_safe()
+        log_path = log_root / "control_center.log"
         try:
             if not logging.getLogger().handlers:
                 log_path = setup_logging()
         except Exception:
             pass
         logging.error("Control Center failed to start", exc_info=exc)
-        details = format_traceback_snippet(exc)
+        crash_path = write_crash_log(exc, log_root)
+        diagnostics = build_diagnostics_payload(log_path)
+        details = "\n".join(
+            [
+                f"Crash log: {crash_path}",
+                diagnostics,
+                "",
+                "Traceback:",
+                "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+            ]
+        )
         message = (
             "Control Center failed to start. Check the log file for details.\n"
             "If this keeps happening, reinstall FightingOverlay or reset the settings."
         )
         if os.environ.get("FIGHTINGOVERLAY_SUPPRESS_UI") != "1":
-            show_startup_messagebox("Control Center failed to start", message, details, log_path)
+            try:
+                root = Tk()
+                apply_tk_compatibility_toggles(root)
+                show_fatal_error_ui(root, "Control Center failed to start", message, details, log_path)
+                root.mainloop()
+            except Exception:
+                logging.exception("Failed to render fatal error dialog")
+                show_startup_messagebox("Control Center failed to start", message, format_traceback_snippet(exc), log_path)
         return 1
 
 

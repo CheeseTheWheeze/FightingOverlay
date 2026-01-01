@@ -915,7 +915,11 @@ def main() -> int:
                 return 1
 
             atomic_write(get_current_pointer(), str(target_dir.resolve()))
-            update_shortcut(target_dir / "ControlCenter.exe")
+            resolved_exe = find_offline_executable(target_dir)
+            if resolved_exe:
+                update_shortcut(resolved_exe)
+            else:
+                logging.warning("Shortcut update skipped; ControlCenter.exe not found in %s", target_dir)
             try:
                 copy_bootstrapper(version)
             except PermissionError as exc:

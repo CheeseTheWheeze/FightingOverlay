@@ -36,6 +36,22 @@ def get_outputs_root() -> Path:
     return get_data_root() / "outputs"
 
 
+def get_profiles_root() -> Path:
+    return get_data_root() / "profiles"
+
+
+def get_profile_root(athlete_id: str) -> Path:
+    return get_profiles_root() / athlete_id
+
+
+def get_clips_root(athlete_id: str) -> Path:
+    return get_profile_root(athlete_id) / "clips"
+
+
+def get_clip_root(athlete_id: str, clip_id: str) -> Path:
+    return get_clips_root(athlete_id) / clip_id
+
+
 def get_models_root() -> Path:
     return get_data_root() / "models"
 
@@ -74,3 +90,15 @@ def get_bootstrapper_path() -> Path:
 
 def get_settings_path() -> Path:
     return _require_roaming_appdata() / APP_NAME / "settings.json"
+
+
+def get_db_root() -> Path:
+    return get_data_root() / "db"
+
+
+def get_db_path() -> Path:
+    return get_db_root() / "index.sqlite"
+
+
+def get_corpus_root() -> Path:
+    return get_data_root() / "corpus"
