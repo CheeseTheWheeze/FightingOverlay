@@ -42,14 +42,12 @@ jobs:
           ) | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $bootstrapExe) { throw 'Unable to locate FightingOverlayBootstrap.exe in dist output' }
 
-          $fullAppDir = @(
-            'dist/FightingOverlay',
-            'dist/ControlCenter'
-          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $fullAppDir) { throw 'Unable to locate full app output folder in dist' }
+          $controlCenterExe = Get-ChildItem dist -Recurse -Filter ControlCenter.exe | Select-Object -First 1
+          if (-not $controlCenterExe) { throw 'Unable to locate ControlCenter.exe in dist output' }
+          $controlCenterDir = Split-Path -Parent $controlCenterExe.FullName
 
           "BOOTSTRAP_EXE=$bootstrapExe" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "FULL_APP_DIR=$fullAppDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CONTROL_CENTER_EXE=$($controlCenterExe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
           New-Item -ItemType Directory -Force release_upload | Out-Null
           Copy-Item $bootstrapExe release_upload/FightingOverlayBootstrap.exe -Force
@@ -57,7 +55,10 @@ jobs:
           $stageDir = Join-Path $PWD 'release_stage'
           if (Test-Path $stageDir) { Remove-Item -Recurse -Force $stageDir }
           New-Item -ItemType Directory -Force $stageDir | Out-Null
-          Copy-Item -Path (Join-Path $fullAppDir '*') -Destination $stageDir -Recurse -Force
+          Copy-Item -Path (Join-Path $controlCenterDir '*') -Destination $stageDir -Recurse -Force
+          if (-not (Test-Path (Join-Path $stageDir 'ControlCenter.exe'))) {
+            throw 'ControlCenter.exe was not staged at release_stage/ControlCenter.exe'
+          }
           Get-ChildItem -Path $stageDir -Recurse -Filter '*.zip' |
             Where-Object { $_.Name -ne 'base_library.zip' } |
             Remove-Item -Force
@@ -80,11 +81,13 @@ jobs:
           $zipPath = "release_upload/FightingOverlay-Full-Windows.zip"
           if (-not (Test-Path $zipPath)) { throw "Missing zip: $zipPath" }
           $entries = tar -tf $zipPath 2>$null
-          $exeEntries = $entries | Where-Object { $_ -match '(^|/)(ControlCenter\\.exe|ControlCenter/ControlCenter\\.exe|bin/ControlCenter\\.exe)$' }
+          $exeEntries = $entries | Where-Object { $_ -match '(^|/|\\)ControlCenter\\.exe$' }
           if (-not $exeEntries) { throw "ControlCenter.exe not found in release zip." }
       - name: Run Control Center test mode
+        shell: pwsh
         run: |
-          dist/ControlCenter/ControlCenter.exe --test-mode
+          if (-not $env:CONTROL_CENTER_EXE) { throw "CONTROL_CENTER_EXE is not set" }
+          & $env:CONTROL_CENTER_EXE --test-mode
       
       - name: Run Control Center UI smoke test (python)
         run: |
