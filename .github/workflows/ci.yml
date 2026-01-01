@@ -30,9 +30,23 @@ jobs:
       - name: Build Control Center
         run: |
           pyinstaller --onedir --name ControlCenter --collect-all cv2 apps/control_center/main.py
-      - name: Diagnose build outputs
+      - name: Inventory Control Center build outputs
+        shell: pwsh
         run: |
-          pwsh -Command "Get-ChildItem -Recurse -Force dist, build, release_upload, apps, . | Select-Object FullName, Length"
+          Write-Host "dist/ listing (first 200 entries):"
+          Get-ChildItem dist -Recurse -Force |
+            Select-Object -First 200 FullName, Length |
+            ForEach-Object { Write-Host "$($_.FullName) $($_.Length)" }
+
+          $controlCenterExe = Get-ChildItem dist -Recurse -Filter ControlCenter.exe | Select-Object -First 1
+          if (-not $controlCenterExe) {
+            Write-Host "ControlCenter.exe not found in dist output. Full dist listing:"
+            Get-ChildItem dist -Recurse -Force | Select-Object FullName, Length | Out-String | Write-Host
+            throw 'Unable to locate ControlCenter.exe in dist output'
+          }
+
+          "CONTROL_CENTER_EXE=$($controlCenterExe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Discovered ControlCenter.exe at $($controlCenterExe.FullName)"
       - name: Prepare release assets
         run: |
           pwsh -Command @'
@@ -43,12 +57,12 @@ jobs:
           ) | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $bootstrapExe) { throw 'Unable to locate FightingOverlayBootstrap.exe in dist output' }
 
-          $controlCenterExe = Get-ChildItem dist -Recurse -Filter ControlCenter.exe | Select-Object -First 1
-          if (-not $controlCenterExe) { throw 'Unable to locate ControlCenter.exe in dist output' }
-          $controlCenterDir = Split-Path -Parent $controlCenterExe.FullName
+          if (-not $env:CONTROL_CENTER_EXE) { throw 'CONTROL_CENTER_EXE is not set' }
+          if (-not (Test-Path $env:CONTROL_CENTER_EXE)) { throw "CONTROL_CENTER_EXE does not exist: $env:CONTROL_CENTER_EXE" }
+          $controlCenterExe = Get-Item $env:CONTROL_CENTER_EXE
+          $controlCenterDir = $controlCenterExe.Directory.FullName
 
           "BOOTSTRAP_EXE=$bootstrapExe" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "CONTROL_CENTER_EXE=$($controlCenterExe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
           New-Item -ItemType Directory -Force release_upload | Out-Null
           Copy-Item $bootstrapExe release_upload/FightingOverlayBootstrap.exe -Force
@@ -56,7 +70,16 @@ jobs:
           $stageDir = Join-Path $PWD 'release_stage'
           if (Test-Path $stageDir) { Remove-Item -Recurse -Force $stageDir }
           New-Item -ItemType Directory -Force $stageDir | Out-Null
-          Copy-Item -Path (Join-Path $controlCenterDir '*') -Destination $stageDir -Recurse -Force
+          if ($controlCenterExe.Directory.Name -eq 'ControlCenter') {
+            Copy-Item -Path (Join-Path $controlCenterDir '*') -Destination $stageDir -Recurse -Force
+          } else {
+            Copy-Item -Path $controlCenterExe.FullName -Destination (Join-Path $stageDir 'ControlCenter.exe') -Force
+            Get-ChildItem -Path $controlCenterDir -File |
+              Where-Object { $_.Name -ne $controlCenterExe.Name -and $_.Name -ne 'FightingOverlayBootstrap.exe' } |
+              ForEach-Object {
+                Copy-Item -Path $_.FullName -Destination (Join-Path $stageDir $_.Name) -Force
+              }
+          }
           if (-not (Test-Path (Join-Path $stageDir 'ControlCenter.exe'))) {
             Write-Host "ControlCenter.exe not staged."
             Write-Host "ControlCenter.exe source: $($controlCenterExe.FullName)"
@@ -67,6 +90,7 @@ jobs:
               ForEach-Object { Write-Host $_.FullName }
             throw 'ControlCenter.exe was not staged at release_stage/ControlCenter.exe'
           }
+          "CONTROL_CENTER_STAGE_EXE=$(Join-Path $stageDir 'ControlCenter.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append
           Get-ChildItem -Path $stageDir -Recurse -Filter '*.zip' |
             Where-Object { $_.Name -ne 'base_library.zip' } |
             Remove-Item -Force
@@ -83,10 +107,14 @@ jobs:
           $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
           try {
             $entryNames = $zip.Entries | ForEach-Object { $_.FullName }
-            $zipEntries = $entryNames | Where-Object { $_ -match '\.zip$' }
+            $normalizedEntries = $entryNames | ForEach-Object { $_ -replace '\\','/' }
+            $zipEntries = $normalizedEntries | Where-Object { $_ -match '\.zip$' }
             $unexpected = $zipEntries | Where-Object { $_ -notmatch 'base_library\.zip$' }
-            $exeEntries = $entryNames | Where-Object {
-              $_ -match '(^|/|\\)(\./)?ControlCenter\.exe$' -or $_ -match '^(\./)?ControlCenter\.exe$'
+            $exeEntries = $normalizedEntries | Where-Object {
+              $lower = $_.ToLower()
+              $lower -eq 'controlcenter.exe' -or
+              $lower -eq './controlcenter.exe' -or
+              $lower.EndsWith('/controlcenter.exe')
             }
             if (-not $exeEntries -or $unexpected) {
               Write-Host "Zip path: $zipPath"
@@ -110,8 +138,9 @@ jobs:
       - name: Run Control Center test mode
         shell: pwsh
         run: |
-          if (-not $env:CONTROL_CENTER_EXE) { throw "CONTROL_CENTER_EXE is not set" }
-          & $env:CONTROL_CENTER_EXE --test-mode
+          if (-not $env:CONTROL_CENTER_STAGE_EXE) { throw "CONTROL_CENTER_STAGE_EXE is not set" }
+          if (-not (Test-Path $env:CONTROL_CENTER_STAGE_EXE)) { throw "CONTROL_CENTER_STAGE_EXE does not exist: $env:CONTROL_CENTER_STAGE_EXE" }
+          & $env:CONTROL_CENTER_STAGE_EXE --test-mode
       
       - name: Run Control Center UI smoke test (python)
         run: |
