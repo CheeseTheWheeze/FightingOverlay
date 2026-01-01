@@ -36,6 +36,7 @@ jobs:
       - name: Prepare release assets
         run: |
           pwsh -Command @'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
           $bootstrapExe = @(
             'dist/FightingOverlayBootstrap.exe',
             'dist/FightingOverlayBootstrap/FightingOverlayBootstrap.exe'
@@ -57,6 +58,13 @@ jobs:
           New-Item -ItemType Directory -Force $stageDir | Out-Null
           Copy-Item -Path (Join-Path $controlCenterDir '*') -Destination $stageDir -Recurse -Force
           if (-not (Test-Path (Join-Path $stageDir 'ControlCenter.exe'))) {
+            Write-Host "ControlCenter.exe not staged."
+            Write-Host "ControlCenter.exe source: $($controlCenterExe.FullName)"
+            Write-Host "ControlCenter directory: $controlCenterDir"
+            Write-Host "release_stage contents (first 200 entries):"
+            Get-ChildItem -Path $stageDir -Recurse -Force |
+              Select-Object -First 200 FullName |
+              ForEach-Object { Write-Host $_.FullName }
             throw 'ControlCenter.exe was not staged at release_stage/ControlCenter.exe'
           }
           Get-ChildItem -Path $stageDir -Recurse -Filter '*.zip' |
@@ -65,24 +73,40 @@ jobs:
 
           Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath release_upload/FightingOverlay-Full-Windows.zip -Force
           '@
-      - name: "Guardrail: ensure no nested zip in Full-Windows.zip"
+      - name: "Guardrail: verify Full-Windows.zip"
         shell: pwsh
         run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zipPath = "release_upload/FightingOverlay-Full-Windows.zip"
           if (-not (Test-Path $zipPath)) { throw "Missing zip: $zipPath" }
-          $entries = tar -tf $zipPath 2>$null
-          if (-not $entries) { throw "tar failed reading $zipPath" }
-          $zipEntries = $entries | Where-Object { $_ -match '\.zip$' }
-          $unexpected = $zipEntries | Where-Object { $_ -notmatch 'base_library\.zip$' }
-          if ($unexpected) { throw ("Unexpected nested zip entries: " + ($unexpected -join ", ")) }
-      - name: "Guardrail: ensure ControlCenter.exe present in Full-Windows.zip"
-        shell: pwsh
-        run: |
-          $zipPath = "release_upload/FightingOverlay-Full-Windows.zip"
-          if (-not (Test-Path $zipPath)) { throw "Missing zip: $zipPath" }
-          $entries = tar -tf $zipPath 2>$null
-          $exeEntries = $entries | Where-Object { $_ -match '(^|/|\\)ControlCenter\\.exe$' }
-          if (-not $exeEntries) { throw "ControlCenter.exe not found in release zip." }
+          $zipInfo = Get-Item $zipPath
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $entryNames = $zip.Entries | ForEach-Object { $_.FullName }
+            $zipEntries = $entryNames | Where-Object { $_ -match '\.zip$' }
+            $unexpected = $zipEntries | Where-Object { $_ -notmatch 'base_library\.zip$' }
+            $exeEntries = $entryNames | Where-Object {
+              $_ -match '(^|/|\\)(\./)?ControlCenter\.exe$' -or $_ -match '^(\./)?ControlCenter\.exe$'
+            }
+            if (-not $exeEntries -or $unexpected) {
+              Write-Host "Zip path: $zipPath"
+              Write-Host "Zip size: $($zipInfo.Length) bytes"
+              $topLevel = $entryNames |
+                ForEach-Object { ($_ -split '[\\/]', 2)[0] } |
+                Where-Object { $_ -ne '' } |
+                Sort-Object -Unique
+              Write-Host "Top-level entries:"
+              $topLevel | ForEach-Object { Write-Host $_ }
+              Write-Host "First 200 entries:"
+              $entryNames | Select-Object -First 200 | ForEach-Object { Write-Host $_ }
+              if ($unexpected) {
+                throw ("Unexpected nested zip entries: " + ($unexpected -join ", "))
+              }
+              throw "ControlCenter.exe not found in release zip."
+            }
+          } finally {
+            $zip.Dispose()
+          }
       - name: Run Control Center test mode
         shell: pwsh
         run: |
