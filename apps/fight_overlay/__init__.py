@@ -1,0 +1,1 @@
+"""Fight overlay GUI app."""
