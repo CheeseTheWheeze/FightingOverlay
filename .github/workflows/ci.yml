@@ -16,7 +16,7 @@ jobs:
         shell: pwsh
         run: |
           $matches = Get-ChildItem .github/workflows -Filter *.yml | Select-String -Pattern '\.\.\.'
-          if ($matches) { throw "Workflow contains literal dot-dot-dot tokens. Fix the file and retry." }
+          if ($matches) { throw "Workflow contains literal '...' tokens. Fix the file and retry." }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
