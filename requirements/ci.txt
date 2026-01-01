@@ -2,3 +2,5 @@ opencv-python
 pyinstaller
 fastapi
 uvicorn
+mediapipe
+pillow
